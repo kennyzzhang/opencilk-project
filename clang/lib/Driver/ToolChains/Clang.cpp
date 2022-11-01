@@ -6199,6 +6199,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       // Forward flags for enabling pedigrees.
       Args.AddLastArg(CmdArgs, options::OPT_fopencilk_enable_pedigrees);
 
+      // Forward flags for enabling splitters.
+      Args.AddLastArg(CmdArgs, options::OPT_fopencilk_enable_splitters);
+
       if (!CustomTarget)
         // Add the OpenCilk ABI bitcode file.
         getToolChain().AddOpenCilkABIBitcode(Args, CmdArgs);

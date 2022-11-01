@@ -1506,7 +1506,15 @@ void ToolChain::AddOpenCilkABIBitcode(const ArgList &Args,
   }
 
   bool UseAsan = getSanitizerArgs(Args).needsAsanRt();
-  StringRef OpenCilkBCName = UseAsan ? "opencilk-asan-abi" : "opencilk-abi";
+  // HACK: [2022-11-01; ASI] If splitters are enabled, use the splitter-enabled
+  // ABI bitcode
+  bool EnableSplitters = Args.hasArg(options::OPT_fopencilk_enable_splitters);
+  StringRef OpenCilkBCName =
+      (UseAsan)
+      ? (EnableSplitters ? "opencilk-splitters-asan-abi"
+                         : "opencilk-asan-abi")
+      : (EnableSplitters ? "opencilk-splitters-abi"
+                         : "opencilk-abi");
   if (auto OpenCilkABIBCFilename = getOpenCilkBC(Args, OpenCilkBCName)) {
     if (IsLTO)
       CmdArgs.push_back(Args.MakeArgString("--plugin-opt=opencilk-abi-bitcode=" +
@@ -1631,8 +1639,16 @@ void ToolChain::AddTapirRuntimeLibArgs(const ArgList &Args,
     // Link the opencilk runtime.  We do this after linking the personality
     // function, to ensure that symbols are resolved correctly when using static
     // linking.
+    //
+    // HACK: [2022-11-01; ASI] The splitter-enabled OpenCilk library is
+    // currently a copy of libopencilk (instead of an add-on) with the relevant
+    // changes
+    bool EnableSplitters = Args.hasArg(options::OPT_fopencilk_enable_splitters);
     CmdArgs.push_back(Args.MakeArgString(getOpenCilkRT(
-        Args, UseAsan ? "opencilk-asan" : "opencilk",
+        Args, (UseAsan ? (EnableSplitters ? "opencilk-splitters-asan"
+                                          : "opencilk-asan")
+                       : (EnableSplitters ? "opencilk-splitters"
+                                          : "opencilk")),
         StaticOpenCilk ? ToolChain::FT_Static : ToolChain::FT_Shared)));
 
     // Add to the executable's runpath the default directory containing OpenCilk

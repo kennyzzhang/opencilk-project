@@ -18,6 +18,7 @@ enum CilkOption : uint64_t {
   // Each Cilk option is mapped to a distinct bit.  Currently we support at most
   // 64 Cilk options.
   CilkOpt_Pedigrees = 1ULL << 0,
+  CilkOpt_Splitters = 1ULL << 1,
 };
 
 struct CilkOptionSet {
