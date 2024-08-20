@@ -1338,7 +1338,7 @@ serializeCilktoolKind(LangOptions::CilktoolKind K) {
     CilktoolStr = "cilkscale-benchmark";
     break;
   case LangOptions::Cilktool_Cilkprace:
-    CilktoolStr = "clikprace";
+    CilktoolStr = "cilkprace";
     break;
   case LangOptions::Cilktool_None:
     break;
