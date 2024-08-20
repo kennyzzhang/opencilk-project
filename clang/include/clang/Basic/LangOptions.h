@@ -399,7 +399,7 @@ public:
     Cilktool_Cilkscale,
     Cilktool_Cilkscale_InstructionCount,
     Cilktool_Cilkscale_Benchmark,
-    Cliktool_Cilkprace
+    Cilktool_Cilkprace
   };
 
   enum CilkVersion {
