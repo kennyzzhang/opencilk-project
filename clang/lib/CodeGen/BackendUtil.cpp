@@ -327,6 +327,19 @@ static CSIOptions getCSIOptionsForCilkscaleBenchmark() {
   return Options;
 }
 
+static CSIOptions getCSIOptionsForCilkprace() {
+  CSIOptions Options;
+  // Disable CSI hooks that Cilkscale doesn't need.
+  Options.InstrumentBasicBlocks = false;
+  Options.InstrumentLoops = false;
+  Options.InstrumentCalls = false;
+  Options.InstrumentAtomics = false;
+  Options.InstrumentMemIntrinsics = false;
+  Options.InstrumentAllocas = false;
+  Options.InstrumentAllocFns = false;
+  return Options;
+}
+
 static std::optional<llvm::CodeModel::Model>
 getCodeModel(const CodeGenOptions &CodeGenOpts) {
   unsigned CodeModel = llvm::StringSwitch<unsigned>(CodeGenOpts.CodeModel)
@@ -1189,6 +1202,15 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
               MPM.addPass(CSISetupPass(getCSIOptionsForCilkscaleBenchmark()));
               MPM.addPass(ComprehensiveStaticInstrumentationPass(
                   getCSIOptionsForCilkscaleBenchmark()));
+              MPM.addPass(PB.buildPostCilkInstrumentationPipeline(Level));
+            });
+        break;
+      case LangOptions::CilktoolKind::Cilktool_Cilkprace:
+          PB.registerTapirLoopEndEPCallback(
+            [&PB](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(CSISetupPass(getCSIOptionsForCilkprace()));
+              MPM.addPass(ComprehensiveStaticInstrumentationPass(
+                  getCSIOptionsForCilkprace()));
               MPM.addPass(PB.buildPostCilkInstrumentationPipeline(Level));
             });
         break;
