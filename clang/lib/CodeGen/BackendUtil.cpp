@@ -336,7 +336,7 @@ static CSIOptions getCSIOptionsForCilkprace() {
   //Options.InstrumentAtomics = false;
   //Options.InstrumentMemIntrinsics = false;
   //Options.InstrumentAllocas = false;
-  Options.InstrumentAllocFns = false;
+  //Options.InstrumentAllocFns = false;
   return Options;
 }
 
