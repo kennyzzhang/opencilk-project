@@ -503,6 +503,10 @@ llvm::Function *CodeGenModule::CreateGlobalInitOrCleanUpFunction(
   if (getLangOpts().Sanitize.has(SanitizerKind::Cilk) &&
       !isInNoSanitizeList(SanitizerKind::Cilk, Fn, Loc))
     Fn->addFnAttr(llvm::Attribute::SanitizeCilk);
+  
+  if (getLangOpts().Sanitize.has(SanitizerKind::Cilkprace) &&
+      !isInNoSanitizeList(SanitizerKind::Cilkprace, Fn, Loc))
+    Fn->addFnAttr(llvm::Attribute::SanitizeCilk);
 
   if (getLangOpts().Sanitize.has(SanitizerKind::Memory) &&
       !isInNoSanitizeList(SanitizerKind::Memory, Fn, Loc))
