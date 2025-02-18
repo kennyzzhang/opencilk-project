@@ -1565,7 +1565,7 @@ bool tools::needsCilkSanitizerDeps(const ToolChain &TC, const ArgList &Args) {
   if (Args.hasArg(options::OPT_nostdlibxx)) {
     return false;
   }
-  return SanArgs.needsCilksanRt();
+  return SanArgs.needsCilksanRt() || SanArgs.needsCilkpraceRt();
 }
 
 void tools::linkCilkSanitizerRuntimeDeps(const ToolChain &TC,
@@ -1626,6 +1626,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
       SharedRuntimes.push_back("rtsan");
     if (SanArgs.needsCilksanRt())
       SharedRuntimes.push_back("cilksan");
+    if (SanArgs.needsCilkpraceRt())
+      SharedRuntimes.push_back("cilkprace");
   }
 
   // The stats_client library is also statically linked into DSOs.
@@ -1652,6 +1654,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
   }
   if (!SanArgs.needsSharedRt() && SanArgs.needsCilksanRt())
     StaticRuntimes.push_back("cilksan");
+  if (!SanArgs.needsSharedRt() && SanArgs.needsCilkpraceRt())
+    StaticRuntimes.push_back("cilkprace");
 
   if (!SanArgs.needsSharedRt() && SanArgs.needsRtsanRt() &&
       SanArgs.linkRuntimes())
@@ -1795,6 +1799,23 @@ bool tools::addSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
       CmdArgs.push_back("--android-memtag-heap");
     if (SanArgs.hasMemtagStack())
       CmdArgs.push_back("--android-memtag-stack");
+  }
+
+  if (SanArgs.needsCilksanRt()) {
+    // Interpose the __cilkrts_internal_merge_two_rmaps, __cilkrts_hyper_alloc,
+    // and __cilkrts_hyper_dealloc functions in the OpenCilk runtime, to properly
+    // suppress races involving reducer hyperobjects.
+    CmdArgs.push_back("--wrap=__cilkrts_internal_merge_two_rmaps");
+    CmdArgs.push_back("--wrap=__cilkrts_hyper_alloc");
+    CmdArgs.push_back("--wrap=__cilkrts_hyper_dealloc");
+  }
+  if (SanArgs.needsCilkpraceRt()) {
+    // Interpose the __cilkrts_internal_merge_two_rmaps, __cilkrts_hyper_alloc,
+    // and __cilkrts_hyper_dealloc functions in the OpenCilk runtime, to properly
+    // suppress races involving reducer hyperobjects.
+    CmdArgs.push_back("--wrap=__cilkrts_internal_merge_two_rmaps");
+    CmdArgs.push_back("--wrap=__cilkrts_hyper_alloc");
+    CmdArgs.push_back("--wrap=__cilkrts_hyper_dealloc");
   }
 
   return !StaticRuntimes.empty() || !NonWholeStaticRuntimes.empty();

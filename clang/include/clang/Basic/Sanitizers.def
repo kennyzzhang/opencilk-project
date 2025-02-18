@@ -88,6 +88,9 @@ SANITIZER("realtime", Realtime)
 // CilkSanitizer
 SANITIZER("cilk", Cilk)
 
+// CilkPrace
+SANITIZER("cilkprace", Cilkprace)
+
 // LeakSanitizer
 SANITIZER("leak", Leak)
 
