@@ -481,7 +481,8 @@ private:
   FunctionCallee CsanDetachContinue = nullptr;
   FunctionCallee CsanTaskEntry = nullptr;
   FunctionCallee CsanTaskExit = nullptr;
-  FunctionCallee CsanSync = nullptr;
+  FunctionCallee CsanAfterSync = nullptr;
+  FunctionCallee CsanBeforeSync = nullptr;
   FunctionCallee CsanBeforeLoop = nullptr;
   FunctionCallee CsanAfterLoop = nullptr;
   FunctionCallee CsanAfterAllocFn = nullptr;
@@ -1016,7 +1017,11 @@ void CilkSanitizerImpl::initializeCsanHooks() {
                         /* sync_reg */ SyncRegType, DetContPropertyTy);
   }
   {
-    CsanSync = getHookFunction("__csan_sync", RetType, IDType,
+    CsanBeforeSync = getHookFunction("__csan_before_sync", RetType, IDType,
+                               /* sync_reg */ SyncRegType);
+  }
+  {
+    CsanAfterSync = getHookFunction("__csan_after_sync", RetType, IDType,
                                /* sync_reg */ SyncRegType);
   }
 
@@ -4406,11 +4411,32 @@ bool CilkSanitizerImpl::instrumentSync(SyncInst *SI, unsigned SyncRegNum) {
     return true;
 
   IRBuilder<> IRB(SI);
+  Value *DefaultID = getDefaultID(IRB);
   // Get the ID of this sync.
   uint64_t LocalID = SyncFED.add(*SI);
   Value *SyncID = SyncFED.localToGlobalId(LocalID, IRB);
   // Insert instrumentation before the sync.
-  insertHookCall(SI, CsanSync, {SyncID, IRB.getInt32(SyncRegNum)});
+  insertHookCall(SI, CsanBeforeSync, {SyncID, IRB.getInt32(SyncRegNum)});
+  BasicBlock *SyncBB = SI->getParent();
+  BasicBlock *SyncCont = SI->getSuccessor(0);  
+  BasicBlock *SyncUnwind = nullptr;
+  if (SyncsWithUnwinds.count(SI)) {
+    InvokeInst *II = dyn_cast<InvokeInst>(SyncCont->getTerminator());
+    SyncBB = SyncCont;
+    SyncUnwind = II->getUnwindDest();
+    SyncCont = II->getNormalDest();  
+  }
+  
+  insertHookCallInSuccessorBB(SyncCont, SyncBB, CsanAfterSync, 
+                        {SyncID, IRB.getInt32(SyncRegNum)},
+                        {DefaultID, IRB.getInt32(0)});
+  
+  if (SyncUnwind)
+  {
+    insertHookCallInSuccessorBB(SyncUnwind, SyncBB, CsanAfterSync, 
+        {SyncID, IRB.getInt32(SyncRegNum)},
+        {DefaultID, IRB.getInt32(0)});
+  }
 
   // NOTE: Because Cilksan executes serially, any exceptions thrown before this
   // sync will appear to be thrown from their respective spawns or calls, not
