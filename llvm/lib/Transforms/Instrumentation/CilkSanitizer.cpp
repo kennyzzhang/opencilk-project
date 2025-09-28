@@ -4417,26 +4417,6 @@ bool CilkSanitizerImpl::instrumentSync(SyncInst *SI, unsigned SyncRegNum) {
   Value *SyncID = SyncFED.localToGlobalId(LocalID, IRB);
   // Insert instrumentation before the sync.
   insertHookCall(SI, CsanBeforeSync, {SyncID, IRB.getInt32(SyncRegNum)});
-  BasicBlock *SyncBB = SI->getParent();
-  BasicBlock *SyncCont = SI->getSuccessor(0);  
-  BasicBlock *SyncUnwind = nullptr;
-  if (SyncsWithUnwinds.count(SI)) {
-    InvokeInst *II = dyn_cast<InvokeInst>(SyncCont->getTerminator());
-    SyncBB = SyncCont;
-    SyncUnwind = II->getUnwindDest();
-    SyncCont = II->getNormalDest();  
-  }
-  
-  insertHookCallInSuccessorBB(SyncCont, SyncBB, CsanAfterSync, 
-                        {SyncID, IRB.getInt32(SyncRegNum)},
-                        {DefaultID, IRB.getInt32(0)});
-  
-  if (SyncUnwind)
-  {
-    insertHookCallInSuccessorBB(SyncUnwind, SyncBB, CsanAfterSync, 
-        {SyncID, IRB.getInt32(SyncRegNum)},
-        {DefaultID, IRB.getInt32(0)});
-  }
 
   // NOTE: Because Cilksan executes serially, any exceptions thrown before this
   // sync will appear to be thrown from their respective spawns or calls, not
