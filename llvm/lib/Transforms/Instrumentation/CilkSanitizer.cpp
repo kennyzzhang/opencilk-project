@@ -1021,7 +1021,7 @@ void CilkSanitizerImpl::initializeCsanHooks() {
                                /* sync_reg */ SyncRegType);
   }
   {
-    CsanAfterSync = getHookFunction("__csan_after_sync", RetType, IDType,
+    CsanAfterSync = getHookFunction("__csan_sync", RetType, IDType,
                                /* sync_reg */ SyncRegType);
   }
 
