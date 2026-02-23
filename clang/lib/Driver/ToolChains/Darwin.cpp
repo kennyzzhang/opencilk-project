@@ -3823,6 +3823,7 @@ SanitizerMask Darwin::getSupportedSanitizers() const {
       (isTargetMacOSBased() || isTargetIOSSimulator() ||
        isTargetTvOSSimulator() || isTargetWatchOSSimulator())) {
     Res |= SanitizerKind::Thread;
+    Res |= SanitizerKind::Cilkprace;
     Res |= SanitizerKind::Cilk;
   }
 
