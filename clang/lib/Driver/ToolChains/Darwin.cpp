@@ -1658,6 +1658,14 @@ void DarwinClang::AddLinkRuntimeLibArgs(const ArgList &Args,
       // Cilksan is written in C++ and requires libcxx.
       AddCXXStdlibLibArgs(Args, CmdArgs);
     }
+    if (Sanitize.needsCilkpraceRt()) {
+      // Cilkprace's instrumentation for standard-library routines and LLVM
+      // intrinsics currently requires Cilkprace to be statically linked.
+      AddLinkSanitizerLibArgs(Args, CmdArgs, "cilkprace");
+
+      // Cilkprace is written in C++ and requires libcxx.
+      AddCXXStdlibLibArgs(Args, CmdArgs);
+    }
     if (Sanitize.needsFuzzer() && !Args.hasArg(options::OPT_dynamiclib)) {
       AddLinkSanitizerLibArgs(Args, CmdArgs, "fuzzer", /*shared=*/false);
 
