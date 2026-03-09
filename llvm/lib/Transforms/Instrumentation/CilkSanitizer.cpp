@@ -1272,7 +1272,7 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
       return false;
   }
 
-  // Do not instrument acesses from different address spaces; we cannot deal
+  // Do not instrument accesses from different address spaces; we cannot deal
   // with them.
   if (Addr) {
     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
@@ -2183,7 +2183,8 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPValue(Instruction *I,
     bool FoundAliasingArg = false;
     for (const Value *Arg : CB->args()) {
       // Skip this operand and any operands that are not pointers.
-      if (OpIdx == OperandNum || !Arg->getType()->isPtrOrPtrVectorTy()) {
+      // TODO: Handle pointer-vector types.
+      if (OpIdx == OperandNum || !Arg->getType()->isPointerTy()) {
         ++OpIdx;
         continue;
       }
