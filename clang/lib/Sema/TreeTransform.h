@@ -5581,7 +5581,7 @@ TreeTransform<Derived>::TransformHyperobjectType(TypeLocBuilder &TLB,
     }
   }
 
-  QualType ElementType = getDerived().TransformType(TLB, TL.getPointeeLoc());
+  QualType ElementType = getDerived().TransformType(TLB, TL.getInnerLoc());
   if (ElementType.isNull())
     return QualType();
 
@@ -5593,6 +5593,9 @@ TreeTransform<Derived>::TransformHyperobjectType(TypeLocBuilder &TLB,
 
   HyperobjectTypeLoc NewT = TLB.push<HyperobjectTypeLoc>(Result);
   NewT.setHyperLoc(TL.getHyperLoc());
+  NewT.setOperandParensRange(TL.getOperandParensRange());
+  NewT.setFirstOperand(TL.getFirstOperand());
+  NewT.setSecondOperand(TL.getSecondOperand());
   return Result;
 }
 
@@ -17624,10 +17627,14 @@ ExprResult TreeTransform<Derived>::RebuildCXXOperatorCallExpr(
     Second = Result.get();
   }
 
+  bool FirstOverloadable =
+    First->getType().stripHyperobject()->isOverloadableType();
+  bool SecondOverloadable =
+    Second && Second->getType().stripHyperobject()->isOverloadableType();
+
   // Determine whether this should be a builtin operation.
   if (Op == OO_Subscript) {
-    if (!First->getType()->isOverloadableType() &&
-        !Second->getType()->isOverloadableType())
+    if (!FirstOverloadable && !SecondOverloadable)
       return getSema().CreateBuiltinArraySubscriptExpr(First, CalleeLoc, Second,
                                                        OpLoc);
   } else if (Op == OO_Arrow) {
@@ -17638,7 +17645,7 @@ ExprResult TreeTransform<Derived>::RebuildCXXOperatorCallExpr(
     // -> is never a builtin operation.
     return SemaRef.BuildOverloadedArrowExpr(nullptr, First, OpLoc);
   } else if (Second == nullptr || isPostIncDec) {
-    if (!First->getType()->isOverloadableType() ||
+    if (!FirstOverloadable ||
         (Op == OO_Amp && getSema().isQualifiedMemberAccess(First))) {
       // The argument is not of overloadable type, or this is an expression
       // of the form &Class::member, so try to create a built-in unary
@@ -17650,8 +17657,7 @@ ExprResult TreeTransform<Derived>::RebuildCXXOperatorCallExpr(
     }
   } else {
     if (!First->isTypeDependent() && !Second->isTypeDependent() &&
-        !First->getType()->isOverloadableType() &&
-        !Second->getType()->isOverloadableType()) {
+        !FirstOverloadable && !SecondOverloadable) {
       // Neither of the arguments is type-dependent or has an overloadable
       // type, so try to create a built-in binary operation.
       BinaryOperatorKind Opc = BinaryOperator::getOverloadedOpcode(Op);

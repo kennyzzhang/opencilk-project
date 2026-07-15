@@ -2141,6 +2141,11 @@ QualType Sema::BuildHyperobjectType(QualType Element,
         // in the case of non-lvalue callbacks.
       }
     } else if (!Identity) {
+      // In the diagnostic case, a diagnostic has already been emitted
+      // if the element type is DeducedTemplateSpecializationType.
+      // Suppressing err_view_must_be_class results in a hyperobject that
+      // generates an error when it is used because it is not
+      // marked as containing errors.
       if (!Element->isRecordType() && !Element->isDependentType() &&
           !Element->containsErrors()) {
         Diag(Loc, diag::err_view_must_be_class) << Element;
@@ -4598,8 +4603,10 @@ static TypeSourceInfo *GetFullTypeForDeclarator(TypeProcessingState &state,
         case DeclaratorChunk::Array:
           DiagKind = 2;
           break;
-        case DeclaratorChunk::Pipe:
         case DeclaratorChunk::Hyperobject:
+          DiagKind = 4;
+          break;
+        case DeclaratorChunk::Pipe:
           break;
         }
 
@@ -6518,6 +6525,10 @@ namespace {
     }
     void VisitHyperobjectTypeLoc(HyperobjectTypeLoc TL) {
       TL.setHyperLoc(Chunk.Loc);
+      const DeclaratorChunk::HyperobjectTypeInfo &HTI = Chunk.Hyper;
+      TL.setOperandParensRange(SourceRange(HTI.LParenLoc, HTI.RParenLoc));
+      TL.setFirstOperand(HTI.Arg[0]);
+      TL.setSecondOperand(HTI.Arg[1]);
     }
 
     void VisitTypeLoc(TypeLoc TL) {

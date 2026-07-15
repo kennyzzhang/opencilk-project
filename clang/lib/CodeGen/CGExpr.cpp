@@ -6147,6 +6147,16 @@ LValue CodeGenFunction::EmitBinaryOperatorLValue(const BinaryOperator *E) {
       return LV;
     }
 
+    if (CanSpawnStore(E->getRHS())) {
+      // Compute the address to store into.
+      LValue LV = EmitCheckedLValue(E->getLHS(), TCK_Store);
+
+      // Emit this expression to store into the computed address.
+      EmitScalarExprIntoLValue(E->getRHS(), LV);
+
+      return LV;
+    }
+
     // TODO: Can we de-duplicate this code with the corresponding code in
     // CGExprScalar, similar to the way EmitCompoundAssignmentLValue works?
     RValue RV;
@@ -6354,7 +6364,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   assert(CalleeType->isFunctionPointerType() &&
          "Call must have function pointer type!");
 
-  if (IsSpawned) {
+  if (IsSpawned && (!CurDetachScope || !CurDetachScope->IsDetachStarted())) {
     PushDetachScope();
     CurDetachScope->EnsureTaskFrame();
   }

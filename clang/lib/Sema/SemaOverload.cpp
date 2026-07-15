@@ -1671,6 +1671,10 @@ TryUserDefinedConversion(Sema &S, Expr *From, QualType ToType,
     return ICS;
   }
 
+  ImplicitConversionKind FirstKind = ICK_Identity;
+  if (From->getType()->isHyperobjectType())
+    FirstKind = ICK_Hyperobject_To_View;
+
   // Attempt user-defined conversion.
   OverloadCandidateSet Conversions(From->getExprLoc(),
                                    OverloadCandidateSet::CSK_Normal);
@@ -1725,8 +1729,11 @@ TryUserDefinedConversion(Sema &S, Expr *From, QualType ToType,
         ICS.Standard.FromBracedInitList = FromListInit;
         ICS.Standard.CopyConstructor = Constructor;
         ICS.Standard.FoundCopyConstructor = Found;
+        ICS.Standard.First = FirstKind; // OpenCilk
         if (ToCanon != FromCanon)
           ICS.Standard.Second = ICK_Derived_To_Base;
+      } else if (FirstKind != ICK_Identity) {
+        ICS.UserDefined.Before.First = FirstKind; // OpenCilk
       }
     }
     break;
@@ -1804,7 +1811,12 @@ TryImplicitConversion(Sema &S, Expr *From, QualType ToType,
   //   given Conversion rank, in spite of the fact that a copy/move
   //   constructor (i.e., a user-defined conversion function) is
   //   called for those cases.
-  QualType FromType = From->getType().stripHyperobject();
+  ImplicitConversionKind FirstKind = ICK_Identity;
+  QualType FromType = From->getType();
+  if (FromType->isHyperobjectType()) {
+    FromType = FromType.stripHyperobject();
+    FirstKind = ICK_Hyperobject_To_View;
+  }
   if (ToType->getAs<RecordType>() && FromType->getAs<RecordType>() &&
       (S.Context.hasSameUnqualifiedType(FromType, ToType) ||
        S.IsDerivedFrom(From->getBeginLoc(), FromType, ToType))) {
@@ -1812,6 +1824,7 @@ TryImplicitConversion(Sema &S, Expr *From, QualType ToType,
     ICS.Standard.setAsIdentityConversion();
     ICS.Standard.setFromType(FromType);
     ICS.Standard.setAllToTypes(ToType);
+    ICS.Standard.First = FirstKind; // OpenCilk
 
     // We don't actually check at this point whether there is a valid
     // copy/move constructor, since overloading just assumes that it
@@ -5915,9 +5928,11 @@ static ImplicitConversionSequence TryObjectArgumentInitialization(
     QualType ExplicitParameterType = QualType(),
     bool SuppressUserConversion = false) {
 
+  ImplicitConversionKind FirstKind = ICK_Identity;
   // Remove any Hyperobject type.
   if (const auto *HT = FromType->getAs<HyperobjectType>()) {
     FromType = HT->getElementType();
+    FirstKind = ICK_Hyperobject_To_View;
   }
 
   // We need to have an object of class type.
@@ -6055,6 +6070,7 @@ static ImplicitConversionSequence TryObjectArgumentInitialization(
   // Success. Mark this as a reference binding.
   ICS.setStandard();
   ICS.Standard.setAsIdentityConversion();
+  ICS.Standard.First = FirstKind; // OpenCilk
   ICS.Standard.Second = SecondKind;
   ICS.Standard.setFromType(FromType);
   ICS.Standard.setAllToTypes(ImplicitParamType);
@@ -6144,6 +6160,10 @@ ExprResult Sema::PerformImplicitObjectArgumentInitialization(
     return Diag(From->getBeginLoc(), diag::err_member_function_call_bad_type)
            << ImplicitParamRecordType << FromRecordType
            << From->getSourceRange();
+  }
+
+  if (ICS.Standard.First == ICK_Hyperobject_To_View) {
+    From = BuildHyperobjectLookup(From);
   }
 
   if (ICS.Standard.Second == ICK_Derived_To_Base) {
@@ -8748,7 +8768,7 @@ void Sema::AddMemberOperatorCandidates(OverloadedOperatorKind Op,
   //   three sets of candidate functions, designated member
   //   candidates, non-member candidates and built-in candidates, are
   //   constructed as follows:
-  QualType T1 = Args[0]->getType();
+  QualType T1 = Args[0]->getType().stripHyperobject();
 
   //     -- If T1 is a complete class type or a class currently being
   //        defined, the set of member candidates is the result of the
@@ -10255,7 +10275,8 @@ void Sema::AddBuiltinOperatorCandidates(OverloadedOperatorKind Op,
   SmallVector<BuiltinCandidateTypeSet, 2> CandidateTypes;
   for (unsigned ArgIdx = 0, N = Args.size(); ArgIdx != N; ++ArgIdx) {
     CandidateTypes.emplace_back(*this);
-    CandidateTypes[ArgIdx].AddTypesConvertedFrom(Args[ArgIdx]->getType(),
+    QualType ArgType = Args[ArgIdx]->getType().stripHyperobject();
+    CandidateTypes[ArgIdx].AddTypesConvertedFrom(ArgType,
                                                  OpLoc,
                                                  true,
                                                  (Op == OO_Exclaim ||
@@ -15192,11 +15213,6 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
                                  OverloadedOperatorKind Op,
                                  const UnresolvedSetImpl &Fns,
                                  ArrayRef<Expr *> Args, bool PerformADL) {
-  assert(Args[0]->getType()->getTypeClass() != Type::Hyperobject &&
-         "hyperobjects not allowed in overloading");
-  assert(Args[1]->getType()->getTypeClass() != Type::Hyperobject &&
-         "hyperobjects not allowed in overloading");
-
   SourceLocation OpLoc = CandidateSet.getLocation();
 
   OverloadedOperatorKind ExtraOp =
@@ -15884,9 +15900,9 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
                                                     Expr *Base,
                                                     MultiExprArg ArgExpr) {
   SmallVector<Expr *, 2> Args;
-  Args.push_back(Base);
+  Args.push_back(BuildHyperobjectLookup(Base));
   for (auto *e : ArgExpr) {
-    Args.push_back(e);
+    Args.push_back(BuildHyperobjectLookup(e));
   }
   DeclarationName OpName =
       Context.DeclarationNames.getCXXOperatorName(OO_Subscript);
