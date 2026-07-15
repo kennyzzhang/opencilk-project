@@ -1565,7 +1565,8 @@ bool tools::needsCilkSanitizerDeps(const ToolChain &TC, const ArgList &Args) {
   if (Args.hasArg(options::OPT_nostdlibxx)) {
     return false;
   }
-  return SanArgs.needsCilksanRt() || SanArgs.needsCilkpraceRt();
+  return SanArgs.needsCilksanRt() || SanArgs.needsCilkpraceRt() ||
+    SanArgs.needsCilkPistonRt();
 }
 
 void tools::linkCilkSanitizerRuntimeDeps(const ToolChain &TC,
@@ -1628,6 +1629,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
       SharedRuntimes.push_back("cilksan");
     if (SanArgs.needsCilkpraceRt())
       SharedRuntimes.push_back("cilkprace");
+    if (SanArgs.needsCilkPistonRt())
+      SharedRuntimes.push_back("cilkpiston");
   }
 
   // The stats_client library is also statically linked into DSOs.
@@ -1656,6 +1659,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
     StaticRuntimes.push_back("cilksan");
   if (!SanArgs.needsSharedRt() && SanArgs.needsCilkpraceRt())
     StaticRuntimes.push_back("cilkprace");
+  if (!SanArgs.needsSharedRt() && SanArgs.needsCilkPistonRt())
+    StaticRuntimes.push_back("cilkpiston");
 
   if (!SanArgs.needsSharedRt() && SanArgs.needsRtsanRt() &&
       SanArgs.linkRuntimes())

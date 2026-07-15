@@ -91,6 +91,9 @@ SANITIZER("cilk", Cilk)
 // CilkPrace
 SANITIZER("cilkprace", Cilkprace)
 
+// CilkSanitizer using Piston
+SANITIZER("cilkpiston", CilkPiston)
+
 // LeakSanitizer
 SANITIZER("leak", Leak)
 

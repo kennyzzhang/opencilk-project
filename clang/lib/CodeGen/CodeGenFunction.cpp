@@ -875,7 +875,9 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
       Fn->addFnAttr(llvm::Attribute::SanitizeType);
     if (SanOpts.has(SanitizerKind::NumericalStability))
       Fn->addFnAttr(llvm::Attribute::SanitizeNumericalStability);
-    if (SanOpts.has(SanitizerKind::Cilk) || SanOpts.has(SanitizerKind::Cilkprace))
+    if (SanOpts.has(SanitizerKind::Cilk) ||
+        SanOpts.has(SanitizerKind::Cilkprace) ||
+        SanOpts.has(SanitizerKind::CilkPiston))
       Fn->addFnAttr(llvm::Attribute::SanitizeCilk);
     if (SanOpts.hasOneOf(SanitizerKind::Memory | SanitizerKind::KernelMemory))
       Fn->addFnAttr(llvm::Attribute::SanitizeMemory);

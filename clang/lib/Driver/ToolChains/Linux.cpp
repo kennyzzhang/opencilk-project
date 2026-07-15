@@ -840,6 +840,7 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   if (IsX86_64 || IsAArch64) {
     Res |= SanitizerKind::Cilk;
     Res |= SanitizerKind::Cilkprace;
+    Res |= SanitizerKind::CilkPiston;
     Res |= SanitizerKind::KernelHWAddress;
   }
   if (IsX86_64)

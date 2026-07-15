@@ -1556,6 +1556,35 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
     */
   }
 
+  if (LangOpts.Sanitize.has(SanitizerKind::CilkPiston)) {
+    Builder.defineMacro("__cilkpiston__");
+
+    // For now, CilkPiston uses the same hooks as Cilksan.
+    // [kzz] Although the initial implementation for Piston doesn't handle
+    // locking, this may be something to think about further down the road.
+
+    // Rename library functions that Cilksan tracks for race detection.
+
+    // Pthread locking routines
+    Builder.defineMacro("pthread_mutex_init", "__csan_pthread_mutex_init");
+    Builder.defineMacro("pthread_mutex_destroy",
+                        "__csan_pthread_mutex_destroy");
+    Builder.defineMacro("pthread_mutex_lock", "__csan_pthread_mutex_lock");
+    Builder.defineMacro("pthread_mutex_trylock",
+                        "__csan_pthread_mutex_trylock");
+    Builder.defineMacro("pthread_mutex_unlock", "__csan_pthread_mutex_unlock");
+    Builder.defineMacro("pthread_once", "__csan_pthread_once");
+
+    // C11 locking routines
+    Builder.defineMacro("mtx_init", "__csan_mtx_init");
+    Builder.defineMacro("mtx_destroy", "__csan_mtx_destroy");
+    Builder.defineMacro("mtx_lock", "__csan_mtx_lock");
+    Builder.defineMacro("mtx_trylock", "__csan_mtx_trylock");
+    Builder.defineMacro("mtx_timedlock", "__csan_mtx_timedlock");
+    Builder.defineMacro("mtx_unlock", "__csan_mtx_unlock");
+    Builder.defineMacro("call_once", "__csan_call_once");
+  }
+
   // Add macros to indicate that the program is compiled with different Cilk
   // tools.
   switch (LangOpts.getCilktool()) {

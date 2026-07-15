@@ -1666,6 +1666,15 @@ void DarwinClang::AddLinkRuntimeLibArgs(const ArgList &Args,
       // Cilkprace is written in C++ and requires libcxx.
       AddCXXStdlibLibArgs(Args, CmdArgs);
     }
+    if (Sanitize.needsCilkPistonRt()) {
+      // CilkPiston's instrumentation for standard-library routines and LLVM
+      // intrinsics currently requires Cilkprace to be statically linked.
+      AddLinkSanitizerLibArgs(Args, CmdArgs, "cilkpiston");
+
+      // CilkPiston is written in C++ and requires libcxx.
+      AddCXXStdlibLibArgs(Args, CmdArgs);
+    }
+
     if (Sanitize.needsFuzzer() && !Args.hasArg(options::OPT_dynamiclib)) {
       AddLinkSanitizerLibArgs(Args, CmdArgs, "fuzzer", /*shared=*/false);
 
@@ -3833,6 +3842,7 @@ SanitizerMask Darwin::getSupportedSanitizers() const {
     Res |= SanitizerKind::Thread;
     Res |= SanitizerKind::Cilkprace;
     Res |= SanitizerKind::Cilk;
+    Res |= SanitizerKind::CilkPiston;
   }
 
   if ((IsX86_64 || IsAArch64) && isTargetMacOSBased()) {

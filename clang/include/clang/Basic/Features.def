@@ -149,6 +149,7 @@ FEATURE(dataflow_sanitizer, LangOpts.Sanitize.has(SanitizerKind::DataFlow))
 FEATURE(scudo, LangOpts.Sanitize.hasOneOf(SanitizerKind::Scudo))
 FEATURE(cilk_sanitizer, LangOpts.Sanitize.has(SanitizerKind::Cilk))
 FEATURE(cilkprace_sanitizer, LangOpts.Sanitize.has(SanitizerKind::Cilkprace))
+FEATURE(cilkpiston_sanitizer, LangOpts.Sanitize.has(SanitizerKind::CilkPiston))
 FEATURE(comprehensive_static_instrumentation,
         LangOpts.getComprehensiveStaticInstrumentation())
 FEATURE(ptrauth_intrinsics, LangOpts.PointerAuthIntrinsics &&

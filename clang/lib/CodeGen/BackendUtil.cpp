@@ -1166,7 +1166,9 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       });
     }
     // Register the Cilksan pass.
-    if (LangOpts.Sanitize.has(SanitizerKind::Cilk) || LangOpts.Sanitize.has(SanitizerKind::Cilkprace))
+    if (LangOpts.Sanitize.has(SanitizerKind::Cilk) ||
+        LangOpts.Sanitize.has(SanitizerKind::Cilkprace) ||
+        LangOpts.Sanitize.has(SanitizerKind::CilkPiston))
       PB.registerTapirLateEPCallback(
           [&PB](ModulePassManager &MPM, OptimizationLevel Level) {
             MPM.addPass(CSISetupPass());

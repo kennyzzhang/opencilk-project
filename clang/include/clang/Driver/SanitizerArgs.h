@@ -96,6 +96,7 @@ public:
   bool needsTsanRt() const { return Sanitizers.has(SanitizerKind::Thread); }
   bool needsCilksanRt() const { return Sanitizers.has(SanitizerKind::Cilk); }
   bool needsCilkpraceRt() const { return Sanitizers.has(SanitizerKind::Cilkprace); }
+  bool needsCilkPistonRt() const { return Sanitizers.has(SanitizerKind::CilkPiston); }
   bool needsMsanRt() const { return Sanitizers.has(SanitizerKind::Memory); }
   bool needsFuzzer() const { return Sanitizers.has(SanitizerKind::Fuzzer); }
   bool needsLsanRt() const {
