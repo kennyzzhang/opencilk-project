@@ -6711,7 +6711,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       }
 
       // Forward flags for enabling pedigrees.
-      Args.AddLastArg(CmdArgs, options::OPT_fopencilk_enable_pedigrees);
+      if (SanitizeArgs.needsCilkpraceRt())
+        CmdArgs.push_back("-fopencilk-enable-pedigrees");
+      else
+        Args.AddLastArg(CmdArgs, options::OPT_fopencilk_enable_pedigrees);
 
       if (!CustomTarget)
         // Add the OpenCilk ABI bitcode file.
