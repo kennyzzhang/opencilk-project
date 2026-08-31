@@ -475,6 +475,11 @@ private:
   FunctionCallee CsanWrite = nullptr;
   FunctionCallee CsanLargeRead = nullptr;
   FunctionCallee CsanLargeWrite = nullptr;
+  FunctionCallee GetCurOSLabel = nullptr;
+  bool LoadTakesLabel = false;
+  bool StoreTakesLabel = false;
+  bool LargeLoadTakesLabel = false;
+  bool LargeStoreTakesLabel = false;
   FunctionCallee CsanBeforeCallsite = nullptr;
   FunctionCallee CsanAfterCallsite = nullptr;
   FunctionCallee CsanDetach = nullptr;
@@ -936,39 +941,96 @@ void CilkSanitizerImpl::initializeCsanHooks() {
                                    /* func_id */ IDType, FuncExitPropertyTy);
   }
 
+  LoadTakesLabel = (FunctionNumParamsInBitcode.lookup("__csan_load") >= 5);
+  StoreTakesLabel = (FunctionNumParamsInBitcode.lookup("__csan_store") >= 5);
+  LargeLoadTakesLabel = (FunctionNumParamsInBitcode.lookup("__csan_large_load") >= 5);
+  LargeStoreTakesLabel = (FunctionNumParamsInBitcode.lookup("__csan_large_store") >= 5);
+
+  if (LoadTakesLabel || StoreTakesLabel || LargeLoadTakesLabel || LargeStoreTakesLabel) {
+    FunctionType *GetCurLabTy = FunctionType::get(IRB.getPtrTy(), false);
+    AttrBuilder B(C);
+    B.addAttribute(Attribute::StrandPure);
+    B.addAttribute(Attribute::NoUnwind);
+    B.addAttribute(Attribute::WillReturn);
+    B.addMemoryAttr(MemoryEffects::inaccessibleMemOnly(ModRefInfo::Ref));
+    AttributeList FnAttrs = AttributeList::get(C, AttributeList::FunctionIndex, B);
+    GetCurOSLabel = M.getOrInsertFunction("__cilkrts_get_current_os_label", GetCurLabTy, FnAttrs);
+    if (Function *Fn = dyn_cast<Function>(GetCurOSLabel.getCallee())) {
+      Fn->setCallingConv(CallingConv::PreserveMost);
+      Fn->setAttributes(FnAttrs);
+    }
+  }
+
   {
     AttributeList FnAttrs;
     FnAttrs = FnAttrs.addParamAttribute(
         C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 1, Attribute::ReadNone);
-    CsanRead = getHookFunction("__csan_load", FnAttrs, RetType, IDType,
-                                     AddrType, NumBytesType, LoadPropertyTy);
+    if (LoadTakesLabel) {
+      FnAttrs = FnAttrs.addParamAttribute(
+          C, 4, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+      FnAttrs = FnAttrs.addParamAttribute(C, 4, Attribute::ReadOnly);
+      CsanRead = getHookFunction("__csan_load", FnAttrs, RetType, IDType,
+                                 AddrType, NumBytesType, LoadPropertyTy,
+                                 IRB.getPtrTy());
+    } else {
+      CsanRead = getHookFunction("__csan_load", FnAttrs, RetType, IDType,
+                                 AddrType, NumBytesType, LoadPropertyTy);
+    }
   }
   {
     AttributeList FnAttrs;
     FnAttrs = FnAttrs.addParamAttribute(
         C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 1, Attribute::ReadNone);
-    CsanWrite = getHookFunction("__csan_store", FnAttrs, RetType, IDType,
-                                AddrType, NumBytesType, StorePropertyTy);
+    if (StoreTakesLabel) {
+      FnAttrs = FnAttrs.addParamAttribute(
+          C, 4, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+      FnAttrs = FnAttrs.addParamAttribute(C, 4, Attribute::ReadOnly);
+      CsanWrite = getHookFunction("__csan_store", FnAttrs, RetType, IDType,
+                                  AddrType, NumBytesType, StorePropertyTy,
+                                  IRB.getPtrTy());
+    } else {
+      CsanWrite = getHookFunction("__csan_store", FnAttrs, RetType, IDType,
+                                  AddrType, NumBytesType, StorePropertyTy);
+    }
   }
   {
     AttributeList FnAttrs;
     FnAttrs = FnAttrs.addParamAttribute(
         C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 1, Attribute::ReadNone);
-    CsanLargeRead =
-        getHookFunction("__csan_large_load", FnAttrs, RetType, IDType, AddrType,
-                        LargeNumBytesType, LoadPropertyTy);
+    if (LargeLoadTakesLabel) {
+      FnAttrs = FnAttrs.addParamAttribute(
+          C, 4, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+      FnAttrs = FnAttrs.addParamAttribute(C, 4, Attribute::ReadOnly);
+      CsanLargeRead =
+          getHookFunction("__csan_large_load", FnAttrs, RetType, IDType, AddrType,
+                          LargeNumBytesType, LoadPropertyTy, IRB.getPtrTy());
+    } else {
+      CsanLargeRead =
+          getHookFunction("__csan_large_load", FnAttrs, RetType, IDType, AddrType,
+                          LargeNumBytesType, LoadPropertyTy);
+    }
   }
   {
     AttributeList FnAttrs;
     FnAttrs = FnAttrs.addParamAttribute(
         C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 1, Attribute::ReadNone);
-    CsanLargeWrite =
-        getHookFunction("__csan_large_store", FnAttrs, RetType, IDType,
-                        AddrType, LargeNumBytesType, StorePropertyTy);
+    if (LargeStoreTakesLabel) {
+      FnAttrs = FnAttrs.addParamAttribute(
+          C, 4, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+      FnAttrs = FnAttrs.addParamAttribute(C, 4, Attribute::ReadOnly);
+      CsanLargeWrite =
+          getHookFunction("__csan_large_store", FnAttrs, RetType, IDType,
+                          AddrType, LargeNumBytesType, StorePropertyTy,
+                          IRB.getPtrTy());
+    } else {
+      CsanLargeWrite =
+          getHookFunction("__csan_large_store", FnAttrs, RetType, IDType,
+                          AddrType, LargeNumBytesType, StorePropertyTy);
+    }
   }
 
   {
@@ -3107,7 +3169,12 @@ bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
     Prop.setIsThreadLocal(isThreadLocalObject(lookupUnderlyingObject(Addr)));
     // Instrument the load
     Value *CsiId = LoadFED.localToGlobalId(LocalId, IRB);
-    Value *Args[] = {CsiId, Addr, Size, Prop.getValue(IRB)};
+    SmallVector<Value *, 5> Args = {CsiId, Addr, Size, Prop.getValue(IRB)};
+    if (LargeLoadTakesLabel) {
+      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      Args.push_back(CurLabCall);
+    }
     Instruction *Call = IRB.CreateCall(CsanLargeRead, Args);
     IRB.SetInstDebugLocation(Call);
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
@@ -3115,7 +3182,12 @@ bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
     Prop.setIsThreadLocal(isThreadLocalObject(lookupUnderlyingObject(Addr)));
     // Instrument the store
     Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
-    Value *Args[] = {CsiId, Addr, Size, Prop.getValue(IRB)};
+    SmallVector<Value *, 5> Args = {CsiId, Addr, Size, Prop.getValue(IRB)};
+    if (LargeStoreTakesLabel) {
+      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      Args.push_back(CurLabCall);
+    }
     Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
     IRB.SetInstDebugLocation(Call);
   }
@@ -3597,10 +3669,16 @@ bool CilkSanitizerImpl::instrumentLoadOrStore(Instruction *I,
     assert(LocalId == StoreObjId &&
            "Store received different ID's in FED and object tables.");
     Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
-    Value *Args[] = {CsiId,
-                     IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                     IRB.getInt32(NumBytesAccessed),
-                     Prop.getValue(IRB)};
+    SmallVector<Value *, 5> Args = {
+        CsiId,
+        IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+        IRB.getInt32(NumBytesAccessed),
+        Prop.getValue(IRB)};
+    if (StoreTakesLabel) {
+      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      Args.push_back(CurLabCall);
+    }
     Instruction *Call = IRB.CreateCall(CsanWrite, Args);
     IRB.SetInstDebugLocation(Call);
     NumInstrumentedWrites++;
@@ -3611,10 +3689,16 @@ bool CilkSanitizerImpl::instrumentLoadOrStore(Instruction *I,
     assert(LocalId == LoadObjId &&
            "Load received different ID's in FED and object tables.");
     Value *CsiId = LoadFED.localToGlobalId(LocalId, IRB);
-    Value *Args[] = {CsiId,
-                     IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                     IRB.getInt32(NumBytesAccessed),
-                     Prop.getValue(IRB)};
+    SmallVector<Value *, 5> Args = {
+        CsiId,
+        IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+        IRB.getInt32(NumBytesAccessed),
+        Prop.getValue(IRB)};
+    if (LoadTakesLabel) {
+      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      Args.push_back(CurLabCall);
+    }
     Instruction *Call = IRB.CreateCall(CsanRead, Args);
     IRB.SetInstDebugLocation(Call);
     NumInstrumentedReads++;
@@ -3658,10 +3742,16 @@ bool CilkSanitizerImpl::instrumentAtomic(Instruction *I, IRBuilder<> &IRB) {
   assert(LocalId == StoreObjId &&
          "Store received different ID's in FED and object tables.");
   Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
-  Value *Args[] = {CsiId,
-                   IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                   IRB.getInt32(NumBytesAccessed),
-                   Prop.getValue(IRB)};
+  SmallVector<Value *, 5> Args = {
+      CsiId,
+      IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+      IRB.getInt32(NumBytesAccessed),
+      Prop.getValue(IRB)};
+  if (StoreTakesLabel) {
+    CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+    CurLabCall->setCallingConv(CallingConv::PreserveMost);
+    Args.push_back(CurLabCall);
+  }
   Instruction *Call = IRB.CreateCall(CsanWrite, Args);
   IRB.SetInstDebugLocation(Call);
   NumInstrumentedWrites++;
@@ -4151,9 +4241,15 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
              "Store received different ID's in FED and object tables.");
 
       Value *CsiId = StoreFED.localToGlobalId(StoreId, IRB);
-      Value *Args[] = {CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                       IRB.CreateIntCast(M->getLength(), IntptrTy, false),
-                       Prop.getValue(IRB)};
+      SmallVector<Value *, 5> Args = {
+          CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+          IRB.CreateIntCast(M->getLength(), IntptrTy, false),
+          Prop.getValue(IRB)};
+      if (LargeStoreTakesLabel) {
+        CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+        CurLabCall->setCallingConv(CallingConv::PreserveMost);
+        Args.push_back(CurLabCall);
+      }
       Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
       IRB.SetInstDebugLocation(Call);
       ++NumInstrumentedMemIntrinsicWrites;
@@ -4177,9 +4273,15 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
              "Load received different ID's in FED and object tables.");
 
       Value *CsiId = LoadFED.localToGlobalId(LoadId, IRB);
-      Value *Args[] = {CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                       IRB.CreateIntCast(M->getLength(), IntptrTy, false),
-                       Prop.getValue(IRB)};
+      SmallVector<Value *, 5> Args = {
+          CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+          IRB.CreateIntCast(M->getLength(), IntptrTy, false),
+          Prop.getValue(IRB)};
+      if (LargeLoadTakesLabel) {
+        CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+        CurLabCall->setCallingConv(CallingConv::PreserveMost);
+        Args.push_back(CurLabCall);
+      }
       Instruction *Call = IRB.CreateCall(CsanLargeRead, Args);
       IRB.SetInstDebugLocation(Call);
       ++NumInstrumentedMemIntrinsicReads;
@@ -4203,9 +4305,15 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
            "Store received different ID's in FED and object tables.");
 
     Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
-    Value *Args[] = {CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
-                     IRB.CreateIntCast(M->getLength(), IntptrTy, false),
-                     Prop.getValue(IRB)};
+    SmallVector<Value *, 5> Args = {
+        CsiId, IRB.CreatePointerCast(Addr, IRB.getPtrTy()),
+        IRB.CreateIntCast(M->getLength(), IntptrTy, false),
+        Prop.getValue(IRB)};
+    if (LargeStoreTakesLabel) {
+      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
+      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      Args.push_back(CurLabCall);
+    }
     Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
     IRB.SetInstDebugLocation(Call);
     ++NumInstrumentedMemIntrinsicWrites;

@@ -1633,6 +1633,7 @@ protected:
 
   bool LinkedBitcode = false;
   SmallSet<std::string, 32> FunctionsInBitcode;
+  StringMap<unsigned> FunctionNumParamsInBitcode;
   SmallPtrSet<Value *, 16> LinkedFromBitcode;
 
   // // Cached results of calls to GetUnderlyingObject.

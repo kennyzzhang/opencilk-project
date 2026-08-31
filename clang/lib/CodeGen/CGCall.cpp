@@ -2515,7 +2515,8 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
     }
     if (TargetDecl->hasAttr<StrandPureAttr>()) {
       FuncAttrs.addAttribute(llvm::Attribute::StrandPure);
-      FuncAttrs.addMemoryAttr(llvm::MemoryEffects::readOnly());
+      if (!TargetDecl->hasAttr<ConstAttr>())
+        FuncAttrs.addMemoryAttr(llvm::MemoryEffects::readOnly());
       FuncAttrs.addAttribute(llvm::Attribute::NoUnwind);
     }
     if (TargetDecl->hasAttr<ReducerRegisterAttr>()) {

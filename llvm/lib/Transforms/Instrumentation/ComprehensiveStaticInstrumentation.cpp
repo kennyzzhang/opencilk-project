@@ -2358,8 +2358,10 @@ void CSIImpl::linkInToolFromBitcode(const std::string &BitcodePath) {
                                ToolModule.get(), OrigDiagHandler.get()));
 
     // Get list of functions in ToolModule.
-    for (Function &TF : *ToolModule)
+    for (Function &TF : *ToolModule) {
       FunctionsInBitcode.insert(std::string(TF.getName()));
+      FunctionNumParamsInBitcode[TF.getName()] = TF.getFunctionType()->getNumParams();
+    }
 
     GlobalVariable *GVCtorCopy = copyGlobalArray("llvm.global_ctors", M);
     GlobalVariable *GVDtorCopy = copyGlobalArray("llvm.global_dtors", M);
