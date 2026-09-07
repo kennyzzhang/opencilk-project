@@ -2348,6 +2348,10 @@ void CSIImpl::linkInToolFromBitcode(const std::string &BitcodePath) {
       return;
     }
 
+    // Strip debug info from the tool module so that when its functions are inlined,
+    // they don't introduce broken inline frames into the host module.
+    llvm::StripDebugInfo(*ToolModule);
+
     // Get the original DiagnosticHandler for this context.
     std::unique_ptr<DiagnosticHandler> OrigDiagHandler =
         C.getDiagnosticHandler();
