@@ -952,7 +952,7 @@ void CilkSanitizerImpl::initializeCsanHooks() {
     B.addAttribute(Attribute::StrandPure);
     B.addAttribute(Attribute::NoUnwind);
     B.addAttribute(Attribute::WillReturn);
-    B.addMemoryAttr(MemoryEffects::inaccessibleMemOnly(ModRefInfo::Ref));
+    B.addMemoryAttr(MemoryEffects::none());
     AttributeList FnAttrs = AttributeList::get(C, AttributeList::FunctionIndex, B);
     GetCurOSLabel = M.getOrInsertFunction("__cilkrts_get_current_os_label", GetCurLabTy, FnAttrs);
     if (Function *Fn = dyn_cast<Function>(GetCurOSLabel.getCallee())) {
