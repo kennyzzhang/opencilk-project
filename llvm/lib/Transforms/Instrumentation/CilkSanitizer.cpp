@@ -476,6 +476,21 @@ private:
   FunctionCallee CsanLargeRead = nullptr;
   FunctionCallee CsanLargeWrite = nullptr;
   FunctionCallee GetCurOSLabel = nullptr;
+
+  // Per-function state for hoisting the current-OS-label fetch. The label is
+  // invariant within a strand, and a Tapir spindle is exactly a maximal strand
+  // (spindle boundaries are detach/reattach/sync), so every instrumentation
+  // site in a spindle can share one fetch instead of making its own. Without
+  // this, instrumenting a loop body re-fetches the label every iteration:
+  // cholesky emitted 436 fetches, and the call is not cheap.
+  TaskInfo *CurTaskInfo = nullptr;
+  DominatorTree *CurDomTree = nullptr;
+  DenseMap<const BasicBlock *, CallInst *> SpindleLabelCache;
+
+  // Returns the label fetch to use at IRB's insertion point, creating one at
+  // the enclosing spindle's entry the first time that spindle needs it.
+  CallInst *getCurOSLabelCall(IRBuilder<> &IRB);
+
   bool LoadTakesLabel = false;
   bool StoreTakesLabel = false;
   bool LargeLoadTakesLabel = false;
@@ -3171,8 +3186,7 @@ bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
     Value *CsiId = LoadFED.localToGlobalId(LocalId, IRB);
     SmallVector<Value *, 5> Args = {CsiId, Addr, Size, Prop.getValue(IRB)};
     if (LargeLoadTakesLabel) {
-      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      CallInst *CurLabCall = getCurOSLabelCall(IRB);
       Args.push_back(CurLabCall);
     }
     Instruction *Call = IRB.CreateCall(CsanLargeRead, Args);
@@ -3184,8 +3198,7 @@ bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
     Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
     SmallVector<Value *, 5> Args = {CsiId, Addr, Size, Prop.getValue(IRB)};
     if (LargeStoreTakesLabel) {
-      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      CallInst *CurLabCall = getCurOSLabelCall(IRB);
       Args.push_back(CurLabCall);
     }
     Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
@@ -3253,6 +3266,77 @@ static void setInstrumentationDebugLoc(Function &Instrumented,
   }
 }
 
+CallInst *CilkSanitizerImpl::getCurOSLabelCall(IRBuilder<> &IRB) {
+  BasicBlock *BB = IRB.GetInsertBlock();
+  const BasicBlock *Key = BB;
+  BasicBlock *InsertBB = nullptr;
+
+  if (CurTaskInfo && CurDomTree) {
+    // Walk back to a block TaskInfo and the dominator tree both know about.
+    // Blocks we created during instrumentation are in neither: the MAAP-guarded
+    // "if (!maap)" blocks come from SplitBlockAndInsertIfThen, which is handed a
+    // lazy DomTreeUpdater, so the tree has no node for them yet. Each such block
+    // has exactly one predecessor -- the block it was split out of -- and the
+    // split introduces a plain conditional branch, never a detach, reattach, or
+    // sync, so the predecessor is in the same strand. Cap the walk so a
+    // malformed chain cannot spin.
+    BasicBlock *Known = BB;
+    for (unsigned Steps = 0; Steps < 16; ++Steps) {
+      if (CurTaskInfo->getSpindleFor(Known) && CurDomTree->getNode(Known))
+        break;
+      BasicBlock *Pred = Known->getUniquePredecessor();
+      if (!Pred)
+        break;
+      Known = Pred;
+    }
+    Spindle *S = CurDomTree->getNode(Known) ? CurTaskInfo->getSpindleFor(Known)
+                                            : nullptr;
+    if (S) {
+      // Only hoist when the spindle entry provably dominates this use. It
+      // should by construction (a spindle has a single entry), but a bad hoist
+      // here produces silently wrong labels, so we check rather than assume.
+      // Check dominance against Known rather than BB: the tree may not have a
+      // node for BB yet. Entry dominating Known implies it dominates BB, since
+      // BB is reached from Known through the unique-predecessor chain above.
+      BasicBlock *Entry = S->getEntry();
+      if (Entry && CurDomTree->dominates(Entry, Known)) {
+        Key = Entry;
+        InsertBB = Entry;
+      }
+    }
+  }
+
+  auto It = SpindleLabelCache.find(Key);
+  if (It != SpindleLabelCache.end())
+    return It->second;
+
+  CallInst *Call;
+  if (InsertBB) {
+    BasicBlock::iterator IP = InsertBB->getFirstInsertionPt();
+    IRBuilder<> EntryIRB(&*IP);
+    // An inlinable call in a function with debug info must carry a !dbg
+    // location or the verifier rejects the module. The call moves to the
+    // spindle entry, so borrow a location from there; fall back to the
+    // function scope when the entry block carries none (common at -O0).
+    DebugLoc DL;
+    for (Instruction &EntryI : *InsertBB)
+      if (EntryI.getDebugLoc()) {
+        DL = EntryI.getDebugLoc();
+        break;
+      }
+    if (!DL)
+      if (DISubprogram *SP = InsertBB->getParent()->getSubprogram())
+        DL = DILocation::get(SP->getContext(), SP->getScopeLine(), 0, SP);
+    EntryIRB.SetCurrentDebugLocation(DL);
+    Call = EntryIRB.CreateCall(GetCurOSLabel);
+  } else {
+    Call = IRB.CreateCall(GetCurOSLabel);
+  }
+  Call->setCallingConv(CallingConv::PreserveMost);
+  SpindleLabelCache[Key] = Call;
+  return Call;
+}
+
 bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
 
   if (F.empty() || shouldNotInstrumentFunction(F) ||
@@ -3295,6 +3379,11 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
   LoopInfo &LI = GetLoopInfo(F);
   TaskInfo &TI = GetTaskInfo(F);
   RaceInfo &RI = GetRaceInfo(F);
+
+  // Reset the per-function label-hoisting state before any instrumentation.
+  CurTaskInfo = &TI;
+  CurDomTree = &DT;
+  SpindleLabelCache.clear();
 
   ICFLoopSafetyInfo SafetyInfo;
 
@@ -3675,8 +3764,7 @@ bool CilkSanitizerImpl::instrumentLoadOrStore(Instruction *I,
         IRB.getInt32(NumBytesAccessed),
         Prop.getValue(IRB)};
     if (StoreTakesLabel) {
-      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      CallInst *CurLabCall = getCurOSLabelCall(IRB);
       Args.push_back(CurLabCall);
     }
     Instruction *Call = IRB.CreateCall(CsanWrite, Args);
@@ -3695,8 +3783,7 @@ bool CilkSanitizerImpl::instrumentLoadOrStore(Instruction *I,
         IRB.getInt32(NumBytesAccessed),
         Prop.getValue(IRB)};
     if (LoadTakesLabel) {
-      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      CallInst *CurLabCall = getCurOSLabelCall(IRB);
       Args.push_back(CurLabCall);
     }
     Instruction *Call = IRB.CreateCall(CsanRead, Args);
@@ -3748,8 +3835,7 @@ bool CilkSanitizerImpl::instrumentAtomic(Instruction *I, IRBuilder<> &IRB) {
       IRB.getInt32(NumBytesAccessed),
       Prop.getValue(IRB)};
   if (StoreTakesLabel) {
-    CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-    CurLabCall->setCallingConv(CallingConv::PreserveMost);
+    CallInst *CurLabCall = getCurOSLabelCall(IRB);
     Args.push_back(CurLabCall);
   }
   Instruction *Call = IRB.CreateCall(CsanWrite, Args);
@@ -4246,8 +4332,7 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
           IRB.CreateIntCast(M->getLength(), IntptrTy, false),
           Prop.getValue(IRB)};
       if (LargeStoreTakesLabel) {
-        CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-        CurLabCall->setCallingConv(CallingConv::PreserveMost);
+        CallInst *CurLabCall = getCurOSLabelCall(IRB);
         Args.push_back(CurLabCall);
       }
       Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
@@ -4278,8 +4363,7 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
           IRB.CreateIntCast(M->getLength(), IntptrTy, false),
           Prop.getValue(IRB)};
       if (LargeLoadTakesLabel) {
-        CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-        CurLabCall->setCallingConv(CallingConv::PreserveMost);
+        CallInst *CurLabCall = getCurOSLabelCall(IRB);
         Args.push_back(CurLabCall);
       }
       Instruction *Call = IRB.CreateCall(CsanLargeRead, Args);
@@ -4310,8 +4394,7 @@ bool CilkSanitizerImpl::instrumentAnyMemIntrinAcc(Instruction *I,
         IRB.CreateIntCast(M->getLength(), IntptrTy, false),
         Prop.getValue(IRB)};
     if (LargeStoreTakesLabel) {
-      CallInst *CurLabCall = IRB.CreateCall(GetCurOSLabel);
-      CurLabCall->setCallingConv(CallingConv::PreserveMost);
+      CallInst *CurLabCall = getCurOSLabelCall(IRB);
       Args.push_back(CurLabCall);
     }
     Instruction *Call = IRB.CreateCall(CsanLargeWrite, Args);
