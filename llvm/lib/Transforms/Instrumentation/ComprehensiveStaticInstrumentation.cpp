@@ -98,6 +98,17 @@ static cl::opt<bool> ClInterpose("csi-interpose", cl::init(true),
                                  cl::desc("Enable function interpositioning"),
                                  cl::Hidden);
 
+// Profiling aid: keep the tool bitcode's debug info so that, once the tool is
+// inlined into instrumented code, a sampling profiler can attribute time to
+// the tool's own source lines instead of charging it all to the host function.
+// This is why the info is stripped by default: on some modules the inlined
+// tool scopes trip a LexicalScopes assertion in codegen (seen on the cilkprace
+// qsort.cpp benchmark). The C benchmarks compile fine. Profiling use only.
+static cl::opt<bool> ClKeepToolDebugInfo(
+    "csi-keep-tool-debug-info", cl::init(false),
+    cl::desc("Keep debug info from the tool bitcode (profiling aid)"),
+    cl::Hidden);
+
 static cl::opt<std::string> ClToolBitcode(
     "csi-tool-bitcode", cl::init(""),
     cl::desc("Path to the tool bitcode file for compile-time instrumentation"),
@@ -2350,7 +2361,8 @@ void CSIImpl::linkInToolFromBitcode(const std::string &BitcodePath) {
 
     // Strip debug info from the tool module so that when its functions are inlined,
     // they don't introduce broken inline frames into the host module.
-    llvm::StripDebugInfo(*ToolModule);
+    if (!ClKeepToolDebugInfo)
+      llvm::StripDebugInfo(*ToolModule);
 
     // Get the original DiagnosticHandler for this context.
     std::unique_ptr<DiagnosticHandler> OrigDiagHandler =
