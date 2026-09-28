@@ -60,6 +60,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
+#include "llvm/Transforms/IPO/InferFunctionAttrs.h"
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
 #include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -1170,7 +1171,14 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         LangOpts.Sanitize.has(SanitizerKind::Cilkprace) ||
         LangOpts.Sanitize.has(SanitizerKind::CilkPiston))
       PB.registerTapirLateEPCallback(
-          [&PB](ModulePassManager &MPM, OptimizationLevel Level) {
+          [&PB, Cilkprace = LangOpts.Sanitize.has(SanitizerKind::Cilkprace)](
+              ModulePassManager &MPM, OptimizationLevel Level) {
+            // Cilkprace checks a free before the call, which needs malloc and
+            // free recognized as allocation functions. That takes the
+            // attributes this pass adds, which -O0 otherwise never runs; it
+            // then falls back to library-call hooks, which run after the free.
+            if (Cilkprace)
+              MPM.addPass(InferFunctionAttrsPass());
             MPM.addPass(CSISetupPass());
             MPM.addPass(CilkSanitizerPass());
             MPM.addPass(PB.buildPostCilkInstrumentationPipeline(Level));
