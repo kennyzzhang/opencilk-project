@@ -505,7 +505,9 @@ private:
   FunctionCallee CsanBeforeSync = nullptr;
   FunctionCallee CsanBeforeLoop = nullptr;
   FunctionCallee CsanAfterLoop = nullptr;
+  FunctionCallee CsanBeforeAllocFn = nullptr;
   FunctionCallee CsanAfterAllocFn = nullptr;
+  FunctionCallee CsanBeforeFree = nullptr;
   FunctionCallee CsanAfterFree = nullptr;
 
   // Hooks for suppressing instrumentation, e.g., around callsites that cannot
@@ -1110,6 +1112,17 @@ void CilkSanitizerImpl::initializeCsanHooks() {
     FnAttrs = FnAttrs.addParamAttribute(
         C, 5, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 5, Attribute::ReadNone);
+    // Before an allocation function with an old pointer (realloc), so a tool
+    // can handle the old block before the allocator can reuse it.
+    AttributeList BeforeAttrs;
+    BeforeAttrs = BeforeAttrs.addParamAttribute(
+        C, 4, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+    BeforeAttrs = BeforeAttrs.addParamAttribute(C, 4, Attribute::ReadNone);
+    CsanBeforeAllocFn = getHookFunction(
+        "__csan_before_allocfn", BeforeAttrs, RetType, IDType,
+        /* size */ LargeNumBytesType, /* num elements */ LargeNumBytesType,
+        /* alignment */ LargeNumBytesType, /* old ptr */ AddrType,
+        /* property */ AllocFnPropertyTy);
     CsanAfterAllocFn = getHookFunction(
         "__csan_after_allocfn", FnAttrs, RetType, IDType,
         /* new ptr */ AddrType, /* size */ LargeNumBytesType,
@@ -1121,6 +1134,11 @@ void CilkSanitizerImpl::initializeCsanHooks() {
     FnAttrs = FnAttrs.addParamAttribute(
         C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
     FnAttrs = FnAttrs.addParamAttribute(C, 1, Attribute::ReadNone);
+    // Before the free, so a tool can handle the block before the allocator
+    // can reuse it.
+    CsanBeforeFree =
+        getHookFunction("__csan_before_free", FnAttrs, RetType, IDType, AddrType,
+                        /* property */ FreePropertyTy);
     CsanAfterFree =
         getHookFunction("__csan_after_free", FnAttrs, RetType, IDType, AddrType,
                         /* property */ FreePropertyTy);
@@ -4888,6 +4906,13 @@ bool CilkSanitizerImpl::instrumentAllocationFn(Instruction *I,
   AllocFnArgs.push_back(Prop.getValue(IRB));
   DefaultAllocFnArgs.push_back(DefaultPropVal);
 
+  // Only calls with an old pointer (realloc) get the before hook.
+  if (!isa<ConstantPointerNull>(AllocFnArgs[3])) {
+    SmallVector<Value *, 6> BeforeAllocFnArgs({AllocFnId});
+    BeforeAllocFnArgs.append(AllocFnArgs.begin(), AllocFnArgs.end());
+    insertHookCall(I, CsanBeforeAllocFn, BeforeAllocFnArgs);
+  }
+
   BasicBlock::iterator Iter(I);
   if (IsInvoke) {
     // There are two "after" positions for invokes: the normal block and the
@@ -4964,6 +4989,8 @@ bool CilkSanitizerImpl::instrumentFree(Instruction *I,
   LibFunc FreeLibF;
   TLI->getLibFunc(*Called, FreeLibF);
   Prop.setFreeTy(static_cast<unsigned>(getFreeTy(FreeLibF)));
+
+  insertHookCall(I, CsanBeforeFree, {FreeId, Addr, Prop.getValue(IRB)});
 
   BasicBlock::iterator Iter(I);
   Iter++;

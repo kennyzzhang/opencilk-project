@@ -6716,6 +6716,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       else
         Args.AddLastArg(CmdArgs, options::OPT_fopencilk_enable_pedigrees);
 
+      // Cilkprace has no MAAP support: its checks are cheaper than MAAP's
+      // bookkeeping.
+      if (SanitizeArgs.needsCilkpraceRt()) {
+        CmdArgs.push_back("-mllvm");
+        CmdArgs.push_back("-cilksan-maap-checks=false");
+      }
+
       if (!CustomTarget)
         // Add the OpenCilk ABI bitcode file.
         getToolChain().AddOpenCilkABIBitcode(Args, CmdArgs);
