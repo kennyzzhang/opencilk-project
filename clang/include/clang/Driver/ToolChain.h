@@ -865,6 +865,11 @@ public:
   virtual std::optional<std::string>
   getOpenCilkBC(const llvm::opt::ArgList &Args, StringRef Component) const;
 
+  /// getCilktoolBC - The bitcode of a Cilk race detector's runtime (such as
+  /// cilkprace) in the OpenCilk runtime directories, if it is there.
+  virtual std::optional<std::string>
+  getCilktoolBC(const llvm::opt::ArgList &Args, StringRef Tool) const;
+
   virtual std::string getOpenCilkRTBasename(const llvm::opt::ArgList &Args,
                                             StringRef Component, FileType Type,
                                             bool AddArch) const;

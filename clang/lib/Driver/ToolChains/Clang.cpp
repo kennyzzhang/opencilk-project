@@ -6723,6 +6723,28 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
         CmdArgs.push_back("-cilksan-maap-checks=false");
       }
 
+      // Cilkprace's load and store hooks take the strand's label, and the
+      // instrumentation learns the hooks' signatures from the tool's bitcode.
+      // Without the bitcode it calls the label-less hooks of other tools,
+      // which cilkprace's runtime misreads, so no access is checked. Pass the
+      // bitcode unless -mllvm -cilksan-bc-path= already names one.
+      if (SanitizeArgs.needsCilkpraceRt() &&
+          llvm::none_of(Args.getAllArgValues(options::OPT_mllvm),
+                        [](StringRef A) {
+                          return A.starts_with("-cilksan-bc-path");
+                        })) {
+        if (auto BC = getToolChain().getCilktoolBC(Args, "cilkprace")) {
+          CmdArgs.push_back("-mllvm");
+          CmdArgs.push_back(Args.MakeArgString("-cilksan-bc-path=" + *BC));
+        } else {
+          D.Diag(D.getDiags().getCustomDiagID(
+              DiagnosticsEngine::Warning,
+              "cannot find the cilkprace bitcode in the OpenCilk runtime "
+              "directory; race checks will be skipped (pass -mllvm "
+              "-cilksan-bc-path=<file>)"));
+        }
+      }
+
       if (!CustomTarget)
         // Add the OpenCilk ABI bitcode file.
         getToolChain().AddOpenCilkABIBitcode(Args, CmdArgs);

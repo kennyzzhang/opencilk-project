@@ -3925,6 +3925,25 @@ void DarwinClang::AddOpenCilkABIBitcode(const ArgList &Args,
       << BitcodeFilename;
 }
 
+// Named like the ABI bitcode: lib<tool>_osx-arm64.bc.
+std::optional<std::string>
+DarwinClang::getCilktoolBC(const ArgList &Args, StringRef Tool) const {
+  SmallString<128> BitcodeFilename("lib");
+  BitcodeFilename += Tool;
+  BitcodeFilename += "_";
+  BitcodeFilename += getOSLibraryNameSuffix();
+  BitcodeFilename += "-";
+  BitcodeFilename += getMachOArchName(Args);
+  BitcodeFilename += ".bc";
+  for (auto RuntimePath : getOpenCilkRuntimePaths(Args)) {
+    SmallString<128> P(RuntimePath);
+    llvm::sys::path::append(P, BitcodeFilename);
+    if (getVFS().exists(P))
+      return std::string(P.str());
+  }
+  return ToolChain::getCilktoolBC(Args, Tool);
+}
+
 void DarwinClang::AddLinkTapirRuntimeLib(const ArgList &Args,
                                          ArgStringList &CmdArgs,
                                          StringRef LibName,

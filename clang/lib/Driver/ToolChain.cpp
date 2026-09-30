@@ -1994,6 +1994,11 @@ std::optional<std::string> ToolChain::getOpenCilkBC(const ArgList &Args,
   return std::nullopt;
 }
 
+std::optional<std::string> ToolChain::getCilktoolBC(const ArgList &Args,
+                                                    StringRef Tool) const {
+  return getOpenCilkBC(Args, Tool);
+}
+
 void ToolChain::AddOpenCilkABIBitcode(const ArgList &Args,
                                       ArgStringList &CmdArgs,
                                       bool IsLTO) const {

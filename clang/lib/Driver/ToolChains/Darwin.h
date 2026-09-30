@@ -682,6 +682,9 @@ public:
                              llvm::opt::ArgStringList &CmdArgs,
                              bool IsLTO = false) const override;
 
+  std::optional<std::string>
+  getCilktoolBC(const llvm::opt::ArgList &Args, StringRef Tool) const override;
+
   void AddLinkTapirRuntime(const llvm::opt::ArgList &Args,
                            llvm::opt::ArgStringList &CmdArgs,
                            bool LinkerIsLLD) const override;
