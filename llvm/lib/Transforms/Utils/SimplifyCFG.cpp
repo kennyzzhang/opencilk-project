@@ -8611,9 +8611,20 @@ static bool serializeDetachToImmediateSync(BasicBlock *BB,
 
       // Move static alloca instructions in the detached block to the
       // appropriate entry block.
-      if (isa<Instruction>(SyncRegion))
-        MoveStaticAllocasInBlock(cast<Instruction>(SyncRegion)->getParent(),
-                                 Detached, ReattachPreds);
+      if (Instruction *SRI = dyn_cast<Instruction>(SyncRegion)) {
+        BasicBlock *SRBlock = SRI->getParent();
+        Instruction *OldFirst = &SRBlock->front();
+        MoveStaticAllocasInBlock(SRBlock, Detached, ReattachPreds);
+        // Outside the entry block, the sync region might start after a
+        // taskframe.end or taskframe.create in the same block, for example
+        // after a cilk_scope or cilk_for.  Instructions moved to the start of
+        // that block would then be in a different taskframe from their uses,
+        // which lowering cannot handle for sync regions.  Move them to just
+        // after the sync region instead, which still dominates the detach.
+        if (!SRBlock->isEntryBlock() && &SRBlock->front() != OldFirst)
+          SRBlock->splice(std::next(SRI->getIterator()), SRBlock,
+                          SRBlock->begin(), OldFirst->getIterator());
+      }
 
       // Erase any instructions marked to be erased.
       for (Instruction *I : ToErase)

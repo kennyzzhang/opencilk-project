@@ -88,6 +88,29 @@ STATISTIC(
 STATISTIC(
     NumHoistedInstrumentedWrites,
     "Number of writes whose instrumentation has been coalesced and hoisted");
+STATISTIC(NumNestAccesses,
+          "Number of accesses covered by checks hoisted before a loop nest");
+STATISTIC(NumNestChecks, "Number of range checks hoisted before loop nests");
+STATISTIC(NumSymNestAccesses, "Number of accesses covered by checks hoisted "
+                              "before a loop nest with symbolic bounds");
+STATISTIC(NumSymNestChecks, "Number of range-check sites (each possibly a "
+                            "loop of checks) hoisted before symbolic nests");
+STATISTIC(NumFootprintMarkers,
+          "Number of footprint markers placed before symbolic nests");
+STATISTIC(NumFootprintMarkersUsed,
+          "Number of footprint markers turned into range checks");
+STATISTIC(NumFootprintTagsPaired,
+          "Number of tagged accesses paired with a footprint marker");
+STATISTIC(NumFootprintTagsLost,
+          "Number of tagged accesses without a footprint marker");
+STATISTIC(NumBlockAccesses,
+          "Number of accesses covered by range checks within a basic block");
+STATISTIC(NumBlockChecks, "Number of range checks within basic blocks");
+STATISTIC(NumMergedMAAPGuarded,
+          "Number of range checks (nests, blocks) MAAP can skip");
+STATISTIC(NumMergedMAAPLost,
+          "Number of range checks (nests, blocks) MAAP could skip by their "
+          "representative alone but not by every access they cover");
 STATISTIC(NumSunkInstrumentedReads,
           "Number of reads whose instrumentation has been coalesced and sunk");
 STATISTIC(NumSunkInstrumentedWrites,
@@ -126,6 +149,130 @@ static cl::opt<bool> MAAPChecks("cilksan-maap-checks", cl::init(true),
 static cl::opt<bool> LoopHoisting(
     "cilksan-loop-hoisting", cl::init(true), cl::Hidden,
     cl::desc("Enable or disable hoisting instrumentation out of loops."));
+
+static cl::opt<bool> HoistNests(
+    "cilksan-hoist-nests", cl::init(false), cl::Hidden,
+    cl::desc("Check the exact footprint of a serial loop nest with constant "
+             "trip counts once, before the nest, instead of each access."));
+
+static cl::opt<bool> HoistSymbolicNests(
+    "cilksan-hoist-symbolic-nests", cl::init(false), cl::Hidden,
+    cl::desc("Like -cilksan-hoist-nests, for nests whose trip counts and "
+             "strides are fixed on entry but not constant: each access's "
+             "footprint becomes one range check, or a loop of up to two "
+             "levels of row checks, before the nest. The footprints are "
+             "found before the vectorizer (see CilksanFootprintsPass)."));
+
+static cl::opt<bool> CoalesceBlocks(
+    "cilksan-coalesce-blocks", cl::init(false), cl::Hidden,
+    cl::desc("Check the exact footprint of straight-line accesses at constant "
+             "offsets from one base, between calls in a basic block, with "
+             "range checks instead of each access (e.g. unrolled kernels)."));
+
+// The instructions of S in the order they appear in their function. Iterating
+// a SmallPtrSet follows pointer values, which differ from run to run, and
+// that order decides the order of the code SCEVExpander emits.
+static SmallVector<Instruction *, 8>
+inProgramOrder(const SmallPtrSetImpl<Instruction *> &S) {
+  SmallVector<Instruction *, 8> V(S.begin(), S.end());
+  if (V.size() < 2)
+    return V;
+  DenseMap<const Instruction *, unsigned> Pos;
+  unsigned N = 0;
+  for (BasicBlock &BB : *V[0]->getFunction())
+    for (Instruction &I : BB)
+      if (S.count(&I))
+        Pos[&I] = N++;
+  llvm::sort(V, [&](Instruction *A, Instruction *B) { return Pos[A] < Pos[B]; });
+  return V;
+}
+
+// The bytes a load or store accesses: its store size, unlike
+// ScalarEvolution::getElementSize, which gives the type's allocation size and
+// so rounds a vector like <6 x i64> (48 bytes) up to 64 on x86, making a range
+// check claim bytes the access doesn't touch -- a false race with whoever
+// writes them. Null for other instructions, like getElementSize.
+static const SCEV *accessSize(ScalarEvolution &SE, Instruction *I) {
+  Type *Ty;
+  if (auto *St = dyn_cast<StoreInst>(I))
+    Ty = St->getValueOperand()->getType();
+  else if (auto *Ld = dyn_cast<LoadInst>(I))
+    Ty = Ld->getType();
+  else
+    return nullptr;
+  return SE.getStoreSizeOfExpr(
+      SE.getEffectiveSCEVType(PointerType::getUnqual(I->getContext())), Ty);
+}
+
+// The size of a plain load or store (not volatile, unordered) with a
+// constant size. None for anything else.
+static std::optional<int64_t> plainAccessSize(Instruction &I,
+                                              ScalarEvolution &SE) {
+  if (auto *Ld = dyn_cast<LoadInst>(&I)) {
+    if (Ld->isVolatile() || !Ld->isUnordered())
+      return std::nullopt;
+  } else if (auto *St = dyn_cast<StoreInst>(&I)) {
+    if (St->isVolatile() || !St->isUnordered())
+      return std::nullopt;
+  } else {
+    return std::nullopt;
+  }
+  const auto *Sz = dyn_cast<SCEVConstant>(accessSize(SE, &I));
+  if (!Sz)
+    return std::nullopt;
+  return Sz->getAPInt().getSExtValue();
+}
+
+// The size of an access the hoisting passes (HoistNests, HoistSymbolicNests,
+// CoalesceBlocks) may cover: a plain access (see plainAccessSize) that would
+// be checked, and not opaquely. None for anything else.
+static std::optional<int64_t> hoistableAccessSize(Instruction &I, RaceInfo &RI,
+                                                  ScalarEvolution &SE) {
+  std::optional<int64_t> Size = plainAccessSize(I, SE);
+  if (!Size || !(RI.mightRaceViaAncestor(&I) || RI.mightRaceLocally(&I)) ||
+      RI.mightRaceOpaquely(&I))
+    return std::nullopt;
+  return Size;
+}
+
+// Footprint markers (see CilksanFootprintsPass): the function they call, the
+// metadata kind that ties an access to its marker, and the attribute of a
+// function the early pass has seen.
+static constexpr char FootprintMarkerName[] = "__cilksan_fp";
+static constexpr char FootprintTagKind[] = "cilksan.fp";
+static constexpr char FootprintsAttr[] = "cilksan-footprints";
+static bool checkSanitizeCilkAttr(Function &F);
+
+// B - A, if it is a constant of at most 32 significant bits: the offset
+// between two addresses from one base.
+static std::optional<int64_t> constOffset(ScalarEvolution &SE, const SCEV *B,
+                                          const SCEV *A) {
+  const auto *D = dyn_cast<SCEVConstant>(SE.getMinusSCEV(B, A));
+  if (!D || D->getAPInt().getSignificantBits() > 32)
+    return std::nullopt;
+  return D->getAPInt().getSExtValue();
+}
+
+// The checks for a footprint given as a map of the bytes read (1) and written
+// (2): maximal runs of written bytes, and of bytes only read, as (start,
+// length, written).
+using ByteRun = std::tuple<int64_t, int64_t, bool>;
+static SmallVector<ByteRun, 8> byteMapRuns(ArrayRef<uint8_t> Map) {
+  SmallVector<ByteRun, 8> Runs;
+  for (int64_t b = 0, n = Map.size(); b < n;) {
+    if (!Map[b]) {
+      ++b;
+      continue;
+    }
+    bool W = Map[b] & 2;
+    int64_t e = b;
+    while (e < n && Map[e] && bool(Map[e] & 2) == W)
+      ++e;
+    Runs.emplace_back(b, e - b, W);
+    b = e;
+  }
+  return Runs;
+}
 
 static cl::opt<bool>
     IgnoreSanitizeCilkAttr(
@@ -228,7 +375,7 @@ struct CilkSanitizerImpl : public CSIImpl {
     DomTreeUpdater DTU;
     const TargetLibraryInfo *TLI;
 
-    SmallPtrSet<DetachInst *, 8> Detaches;
+    SmallSetVector<DetachInst *, 8> Detaches;
   };
 
   // Class to manage inserting instrumentation with static race detection.
@@ -303,7 +450,7 @@ struct CilkSanitizerImpl : public CSIImpl {
     DomTreeUpdater DTU;
     const TargetLibraryInfo *TLI;
 
-    SmallPtrSet<DetachInst *, 8> Detaches;
+    SmallSetVector<DetachInst *, 8> Detaches;
 
     DenseMap<const Value *, Value *> LocalMAAPs;
     SmallPtrSet<const Value *, 8> ArgMAAPs;
@@ -458,11 +605,104 @@ struct CilkSanitizerImpl : public CSIImpl {
     return instrumentAnyMemIntrinAcc(I, OperandNum, IRB);
   }
 
+  // A range check of Len bytes from Addr, as a read or write like Rep: hoisted
+  // before loop nest O (see HoistNests), or, for straight-line accesses (see
+  // CoalesceBlocks), inserted before At, after the last access it covers.
+  struct NestCheck {
+    Instruction *Rep;
+    Loop *O;
+    const SCEV *Addr;
+    uint64_t Len;
+    Instruction *At = nullptr;
+    // Symbolic nests (see HoistSymbolicNests): the length is LenS, and the
+    // check repeats over each (stride, count) in Rows, outermost first.
+    const SCEV *LenS = nullptr;
+    SmallVector<std::pair<const SCEV *, const SCEV *>, 2> Rows{};
+    // Conditions fixed on entry to O, and the values under which the
+    // accesses run; the check runs only when all of them hold.
+    SmallVector<std::pair<Value *, bool>, 2> Preds{};
+    // The accesses whose bytes the check covers. With MAAP checks on, it is
+    // skipped only when each of them could skip its own check: their racers
+    // can differ from Rep's.
+    SmallVector<Instruction *, 4> Members{};
+    // A footprint marker's check (see FootprintMarker): its address, length
+    // and rows are already computed before At, and O is null.
+    Value *AddrV = nullptr, *LenV = nullptr;
+    SmallVector<std::pair<Value *, Value *>, 2> RowsV{};
+    Instruction *insertPt() const {
+      return At ? At : O->getLoopPreheader()->getTerminator();
+    }
+  };
+  SmallVector<NestCheck, 8> NestChecks;
+  void planBlockChecks(Function &F, ScalarEvolution &SE, RaceInfo &RI,
+                       SmallVectorImpl<Instruction *> &LoadsAndStores);
+  void planNestChecks(LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT,
+                      TaskInfo &TI, RaceInfo &RI,
+                      SmallPtrSetImpl<Instruction *> &Covered);
+  static const char *whyNotOneStrand(const Loop *O, TaskInfo &TI);
+  // An access of a class (see coverClass): Size bytes at Off from the class's
+  // base, repeated over each (step, count) in Steps, innermost loop first;
+  // none for a straight-line access.
+  struct FootprintAccess {
+    Instruction *I;
+    int64_t Off;
+    int64_t Size;
+    SmallVector<std::pair<int64_t, unsigned>, 4> Steps{};
+  };
+  unsigned coverClass(ArrayRef<FootprintAccess> As, ScalarEvolution &SE,
+                      const SCEV *Base, Loop *O, Instruction *At,
+                      bool FirstRep, int64_t MaxSpan, uint64_t MaxMarks,
+                      unsigned MaxRuns);
+  bool tryNest(Loop *O, LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT,
+               TaskInfo &TI, RaceInfo &RI,
+               SmallPtrSetImpl<Instruction *> &Covered);
+  // A symbolic nest's footprint (see symbolicFootprints): Base + [0, Len) +
+  // the sum of Step_k * [0, Count_k) over Rows, outermost first, accessed
+  // when Preds hold, by Members. Dup marks a footprint another one's check
+  // covers: the same, and a store's or earlier. A footprint that isn't Dup
+  // also has the members of its duplicates.
+  struct SymFootprint {
+    Instruction *I;
+    const SCEV *Base, *Len;
+    SmallVector<std::pair<const SCEV *, const SCEV *>, 2> Rows;
+    SmallVector<std::pair<Value *, bool>, 2> Preds;
+    SmallVector<Instruction *, 4> Members;
+    bool Partly;
+    bool Dup = false;
+  };
+  static bool
+  symbolicFootprints(Loop *O, LoopInfo &LI, ScalarEvolution &SE,
+                     DominatorTree &DT, TaskInfo &TI,
+                     function_ref<std::optional<int64_t>(Instruction &)> SizeOf,
+                     SmallVectorImpl<SymFootprint> &Prints,
+                     DenseMap<Instruction *, unsigned> &NumVersions);
+  static unsigned placeFootprintMarkers(Function &F, LoopInfo &LI,
+                                        ScalarEvolution &SE, DominatorTree &DT,
+                                        TaskInfo &TI);
+  // A footprint marker of a function to instrument, taken out of it before
+  // any analysis sees it: the values it was called with, where its checks go
+  // (At, where it was), and the accesses it covers, each in one strand with
+  // At and after it (see takeFootprintMarkers).
+  struct FootprintMarker {
+    Instruction *At;
+    WeakTrackingVH Guard, Base, Len;
+    SmallVector<std::pair<WeakTrackingVH, WeakTrackingVH>, 2> Rows;
+    SmallVector<Instruction *, 8> Members;
+  };
+  MapVector<Function *, SmallVector<FootprintMarker, 4>> FootprintMarkers;
+  // The values markers were called with, deleted at the end if unused.
+  SmallVector<WeakTrackingVH, 16> FootprintOperands;
+  void takeFootprintMarkers(Function &F, DominatorTree &DT, TaskInfo &TI);
+  void planFootprintChecks(Function &F, ScalarEvolution &SE, RaceInfo &RI,
+                           SmallPtrSetImpl<Instruction *> &Covered);
+  void removeFootprintMarkers();
+
   bool instrumentLoadOrStoreHoisted(Instruction *I,
                                     Value *Addr,
                                     Value *RangeVal,
                                     IRBuilder<> &IRB,
-                                    uint64_t LocalId);
+                                    uint64_t LocalId,
+                                    MaybeAlign Alignment = std::nullopt);
 
 private:
   // Analysis results
@@ -485,11 +725,18 @@ private:
   // cholesky emitted 436 fetches, and the call is not cheap.
   TaskInfo *CurTaskInfo = nullptr;
   DominatorTree *CurDomTree = nullptr;
+  LoopInfo *CurLoopInfo = nullptr;
   DenseMap<const BasicBlock *, CallInst *> SpindleLabelCache;
 
   // Returns the label fetch to use at IRB's insertion point, creating one at
   // the enclosing spindle's entry the first time that spindle needs it.
   CallInst *getCurOSLabelCall(IRBuilder<> &IRB);
+public:
+  // While set, getCurOSLabelCall returns this fetch: the loops of row checks
+  // before a symbolic nest are new blocks that TaskInfo doesn't know, in the
+  // strand of the block they were split from.
+  CallInst *LabelOverride = nullptr;
+private:
 
   bool LoadTakesLabel = false;
   bool StoreTakesLabel = false;
@@ -642,6 +889,10 @@ void CilkSanitizerLegacyPass::getAnalysisUsage(AnalysisUsage &AU) const {
 
 uint64_t ObjectTable::add(Instruction &I, Value *Obj) {
   uint64_t ID = getId(&I);
+  // An access a symbolic nest covers only partly is registered twice: for
+  // its own check and as the representative of the nest's checks.
+  if (LocalIdToSourceLocationMap.count(ID))
+    return ID;
   if (isa<UndefValue>(Obj)) {
     add(ID, -1, "", "", "(undef)");
     return ID;
@@ -802,6 +1053,27 @@ bool CilkSanitizerImpl::run() {
   initializeCsanObjectTables();
   initializeCsanHooks();
 
+  // Take out the footprint markers, placing them first where the early pass
+  // didn't run (see CilksanFootprintsPass), before any analysis sees them.
+  if (EnableStaticRaceDetection && LoopHoisting && HoistNests &&
+      HoistSymbolicNests)
+    for (Function &F : M)
+      if (!F.empty() && !shouldNotInstrumentFunction(F) &&
+          !LinkedFromBitcode.count(&F) && checkSanitizeCilkAttr(F) &&
+          !F.hasFnAttribute(FootprintsAttr))
+        NumFootprintMarkers += placeFootprintMarkers(
+            F, GetLoopInfo(F), (*GetScalarEvolution)(F), GetDomTree(F),
+            GetTaskInfo(F));
+  if (Function *Fn = M.getFunction(FootprintMarkerName)) {
+    SmallPtrSet<Function *, 8> HasMarkers;
+    for (User *U : Fn->users())
+      if (auto *Call = dyn_cast<CallInst>(U))
+        HasMarkers.insert(Call->getFunction());
+    for (Function &F : M)
+      if (HasMarkers.count(&F))
+        takeFootprintMarkers(F, GetDomTree(F), GetTaskInfo(F));
+  }
+
   // Evaluate the SCC's in the callgraph in post order to support
   // interprocedural analysis of potential races in the module.
   SmallVector<Function *, 16> InstrumentedFunctions;
@@ -821,6 +1093,7 @@ bool CilkSanitizerImpl::run() {
     updateInstrumentedFnAttrs(*F);
     F->removeFnAttr(Attribute::SanitizeCilk);
   }
+  removeFootprintMarkers();
 
   CSIImpl::collectUnitFEDTables();
   collectUnitFEDTables();
@@ -1232,7 +1505,7 @@ static void setupBlock(BasicBlock *BB, DomTreeUpdater *DTU, LoopInfo *LI,
   SmallVector<BasicBlock *, 4> SyncUnwindPreds;
   SmallVector<BasicBlock *, 4> AllocFnPreds;
   SmallVector<BasicBlock *, 4> FreeFnPreds;
-  DenseMap<const Function *, SmallVector<BasicBlock *, 4>> LibCallPreds;
+  MapVector<const Function *, SmallVector<BasicBlock *, 4>> LibCallPreds;
   SmallVector<BasicBlock *, 4> InvokePreds;
   bool HasOtherPredTypes = false;
   unsigned NumPredTypes = 0;
@@ -1327,7 +1600,7 @@ static void setupBlock(BasicBlock *BB, DomTreeUpdater *DTU, LoopInfo *LI,
 // one CSI ID space.
 void CilkSanitizerImpl::setupBlocks(Function &F, DominatorTree *DT,
                                     LoopInfo *LI) {
-  SmallPtrSet<BasicBlock *, 8> BlocksToSetup;
+  SmallSetVector<BasicBlock *, 8> BlocksToSetup;
   for (BasicBlock &BB : F) {
     if (BB.isLandingPad())
       BlocksToSetup.insert(&BB);
@@ -1744,24 +2017,24 @@ bool CilkSanitizerImpl::SimpleInstrumentor::instrumentAncillaryInstructions(
     DenseMap<Value *, unsigned> &SyncRegNums,
     DenseMap<BasicBlock *, unsigned> &SRCounters, const DataLayout &DL) {
   bool Result = false;
-  SmallPtrSet<SyncInst *, 4> Syncs;
-  SmallPtrSet<Loop *, 4> Loops;
+  SmallSetVector<SyncInst *, 4> Syncs;
+  SmallSetVector<Loop *, 4> Loops;
 
   // Instrument allocas and allocation-function calls that may be involved in a
   // race.
-  for (Instruction *I : Allocas) {
+  for (Instruction *I : inProgramOrder(Allocas)) {
     // The simple instrumentor just instruments everything
     CilkSanImpl.instrumentAlloca(I, TI);
     getDetachesForInstruction(I);
     Result = true;
   }
-  for (Instruction *I : AllocationFnCalls) {
+  for (Instruction *I : inProgramOrder(AllocationFnCalls)) {
     // The simple instrumentor just instruments everything
     CilkSanImpl.instrumentAllocationFn(I, DT, TLI);
     getDetachesForInstruction(I);
     Result = true;
   }
-  for (Instruction *I : FreeCalls) {
+  for (Instruction *I : inProgramOrder(FreeCalls)) {
     // The first argument of the free call is the pointer.
     Value *Ptr = I->getOperand(0);
     // If the pointer corresponds to an allocation function call in this
@@ -1819,7 +2092,7 @@ void CilkSanitizerImpl::SimpleInstrumentor::getDetachesForInstruction(
   while (!T->isRootTask()) {
     // Once we encounter a detach we've previously added to the set, we know
     // that all its parents are also in the set.
-    if (!Detaches.insert(T->getDetach()).second)
+    if (!Detaches.insert(T->getDetach()))
       return;
     T = T->getParentTask();
   }
@@ -1837,7 +2110,7 @@ void CilkSanitizerImpl::Instrumentor::getDetachesForInstruction(
   while (!T->isRootTask()) {
     // Once we encounter a detach we've previously added to the set, we know
     // that all its parents are also in the set.
-    if (!Detaches.insert(T->getDetach()).second)
+    if (!Detaches.insert(T->getDetach()))
       return;
     T = T->getParentTask();
   }
@@ -2192,6 +2465,52 @@ static MemoryLocation getMemoryLocation(Instruction *I, unsigned OperandNum,
 
 // Evaluate the noalias value in the MAAP for Obj, and intersect that result
 // with the noalias information for other objects.
+// The objects in S in an order that doesn't depend on their addresses, as
+// SmallPtrSet's does: arguments by number, then instructions in function
+// order, then globals in module order. Iterating S directly would make the
+// MAAP code's output, and so the instrumented IR, vary from run to run.
+static SmallVector<const Value *, 4>
+stableObjectOrder(const SmallPtrSetImpl<const Value *> &S) {
+  SmallVector<const Value *, 4> V(S.begin(), S.end());
+  if (V.size() < 2)
+    return V;
+  DenseMap<const BasicBlock *, unsigned> BlockNum;
+  DenseMap<const GlobalValue *, unsigned> GlobalNum;
+  for (const Value *X : V) {
+    if (auto *I = dyn_cast<Instruction>(X); I && BlockNum.empty()) {
+      unsigned N = 0;
+      for (const BasicBlock &BB : *I->getFunction())
+        BlockNum[&BB] = N++;
+    } else if (auto *G = dyn_cast<GlobalValue>(X); G && GlobalNum.empty()) {
+      unsigned N = 0;
+      for (const GlobalValue &H : G->getParent()->global_values())
+        GlobalNum[&H] = N++;
+    }
+  }
+  auto Rank = [](const Value *X) {
+    return isa<Argument>(X) ? 0 : isa<Instruction>(X) ? 1
+                              : isa<GlobalValue>(X)   ? 2
+                                                      : 3;
+  };
+  llvm::stable_sort(V, [&](const Value *A, const Value *B) {
+    if (Rank(A) != Rank(B))
+      return Rank(A) < Rank(B);
+    if (auto *X = dyn_cast<Argument>(A))
+      return X->getArgNo() < cast<Argument>(B)->getArgNo();
+    if (auto *X = dyn_cast<Instruction>(A)) {
+      auto *Y = cast<Instruction>(B);
+      if (X->getParent() != Y->getParent())
+        return BlockNum.lookup(X->getParent()) <
+               BlockNum.lookup(Y->getParent());
+      return X->comesBefore(Y);
+    }
+    if (auto *X = dyn_cast<GlobalValue>(A))
+      return GlobalNum.lookup(X) < GlobalNum.lookup(cast<GlobalValue>(B));
+    return false;
+  });
+  return V;
+}
+
 Value *CilkSanitizerImpl::Instrumentor::getNoAliasMAAPValue(
     Instruction *I, IRBuilder<> &IRB, unsigned OperandNum,
     MemoryLocation Loc, const RaceInfo::RaceData &RD, const Value *Obj,
@@ -2218,7 +2537,7 @@ Value *CilkSanitizerImpl::Instrumentor::getNoAliasMAAPValue(
     // Otherwise we check the underlying objects.
     SmallPtrSet<const Value *, 1> OtherObjects;
     RI.getObjectsFor(OtherRD.Access, OtherObjects);
-    for (const Value *OtherObj : OtherObjects) {
+    for (const Value *OtherObj : stableObjectOrder(OtherObjects)) {
       // If we find another instance of this object in another argument,
       // then we don't have "no alias".
       if (Obj == OtherObj) {
@@ -2304,7 +2623,7 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPValue(Instruction *I,
       RI.getObjectsFor(RaceInfo::MemAccessInfo(
                            Arg, isModSet(AA->getArgModRefInfo(CB, OpIdx))),
                        ArgObjects);
-      for (const Value *Obj : ArgObjects) {
+      for (const Value *Obj : stableObjectOrder(ArgObjects)) {
         // If Loc and the racer object cannot alias, then there's nothing to
         // check.
         if (!AA->alias(Loc, MemoryLocation::getBeforeOrAfter(Obj)))
@@ -2361,7 +2680,7 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPValue(Instruction *I,
     }
 
     // Get MAAPs from objects
-    for (const Value *Obj : Objects) {
+    for (const Value *Obj : stableObjectOrder(Objects)) {
       // If we find an object with no MAAP, give up.
       if (!LocalMAAPs.count(Obj)) {
         LLVM_DEBUG(dbgs() << "No local MAAP found for obj " << *Obj << "\n");
@@ -2385,7 +2704,7 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPValue(Instruction *I,
           IRB.CreateICmpNE(getMAAPIRValue(IRB, 0), ObjNoAliasFlag);
 
       if (RD.Racer.isValid()) {
-        for (const Value *RObj : RacerObjects) {
+        for (const Value *RObj : stableObjectOrder(RacerObjects)) {
           // If the racer object matches Obj, there's no need to check a flag.
           if (RObj == Obj) {
             MV = IRB.CreateOr(MV, LocalRaceVal);
@@ -2521,7 +2840,7 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPCheck(Instruction *I,
     // If we have a valid racer, get the objects that that racer might access.
     SmallPtrSet<const Value *, 1> RacerObjects;
 
-    for (const Value *Obj : Objects) {
+    for (const Value *Obj : stableObjectOrder(Objects)) {
       LLVM_DEBUG(dbgs() << "  Object " << *Obj << "\n");
       LLVM_DEBUG(dbgs() << "    current MAAPChk = " << *MAAPChk << "\n");
       // Ignore objects that are not involved in races.
@@ -2562,7 +2881,7 @@ Value *CilkSanitizerImpl::Instrumentor::getMAAPCheck(Instruction *I,
               getMAAPIRValue(IRB, static_cast<unsigned>(MAAPValue::NoAlias))));
 
       if (RD.Racer.isValid()) {
-        for (const Value *RObj : RacerObjects) {
+        for (const Value *RObj : stableObjectOrder(RacerObjects)) {
           LLVM_DEBUG(dbgs() << "  Racer Object " << *RObj << "\n");
           // If the racer object matches Obj, there's no need to check a flag.
           if (RObj == Obj) {
@@ -2717,13 +3036,15 @@ void CilkSanitizerImpl::Instrumentor::getDetachesForCoalescedInstrumentation(
     SmallPtrSetImpl<Instruction *> &LoopInstToHoist,
     SmallPtrSetImpl<Instruction *> &LoopInstToSink) {
   // Determine detaches to instrument for the coalesced instrumentation.
-  for (Instruction *I : LoopInstToHoist) {
+  for (Instruction *I : inProgramOrder(LoopInstToHoist)) {
     Loop *L = LI.getLoopFor(I->getParent());
     // Record the detaches for the loop preheader, where the coalesced
     // instrumentation will be inserted.
     getDetachesForInstruction(L->getLoopPreheader()->getTerminator());
   }
-  for (Instruction *I : LoopInstToSink) {
+  for (auto &NC : CilkSanImpl.NestChecks)
+    getDetachesForInstruction(NC.insertPt());
+  for (Instruction *I : inProgramOrder(LoopInstToSink)) {
     Loop *L = LI.getLoopFor(I->getParent());
     SmallVector<BasicBlock *, 4> ExitBlocks;
     L->getUniqueExitBlocks(ExitBlocks);
@@ -2749,13 +3070,13 @@ bool CilkSanitizerImpl::Instrumentor::instrumentAncillaryInstructions(
     DenseMap<Value *, unsigned> &SyncRegNums,
     DenseMap<BasicBlock *, unsigned> &SRCounters, const DataLayout &DL) {
   bool Result = false;
-  SmallPtrSet<SyncInst *, 4> Syncs;
-  SmallPtrSet<Loop *, 4> Loops;
+  SmallSetVector<SyncInst *, 4> Syncs;
+  SmallSetVector<Loop *, 4> Loops;
   SmallPtrSet<Instruction *, 16> InstrumentedAllocFns;
 
   // Instrument allocas and allocation-function calls that may be involved in a
   // race.
-  for (Instruction *I : Allocas) {
+  for (Instruction *I : inProgramOrder(Allocas)) {
     if (CilkSanImpl.ObjectMRForRace.count(I) ||
         CilkSanImpl.lookupPointerMayBeCaptured(I)) {
       CilkSanImpl.instrumentAlloca(I, TI);
@@ -2763,7 +3084,7 @@ bool CilkSanitizerImpl::Instrumentor::instrumentAncillaryInstructions(
       Result = true;
     }
   }
-  for (Instruction *I : AllocationFnCalls) {
+  for (Instruction *I : inProgramOrder(AllocationFnCalls)) {
     // Instrument any allocation-function calls that may allocate memory
     // involved in a race.
     //
@@ -2787,7 +3108,7 @@ bool CilkSanitizerImpl::Instrumentor::instrumentAncillaryInstructions(
       Result = true;
     }
   }
-  for (Instruction *I : FreeCalls) {
+  for (Instruction *I : inProgramOrder(FreeCalls)) {
     // The first argument of the free call is the pointer.
     Value *Ptr = I->getOperand(0);
     // If the pointer corresponds to an allocation function call in this
@@ -2839,6 +3160,20 @@ bool CilkSanitizerImpl::Instrumentor::instrumentAncillaryInstructions(
 }
 
 // Helper function to get a value for the runtime trip count of the given loop.
+// True if L is not a Tapir loop and holds no detach, reattach or sync, so all
+// of its iterations run in one strand: two of its accesses can only race
+// through strands outside it.
+static bool isSerialStrandLoop(const Loop *L, TaskInfo &TI) {
+  if (getTaskIfTapirLoop(L, &TI))
+    return false;
+  for (const BasicBlock *BB : L->blocks()) {
+    const Instruction *T = BB->getTerminator();
+    if (isa<DetachInst>(T) || isa<ReattachInst>(T) || isa<SyncInst>(T))
+      return false;
+  }
+  return true;
+}
+
 static const SCEV *getRuntimeTripCount(Loop &L, ScalarEvolution *SE,
                                        bool IsTapirLoop) {
   BasicBlock *Latch = L.getLoopLatch();
@@ -2903,7 +3238,7 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
   // instrumentation.
   DenseMap<Instruction *, std::pair<Value *, Value *>> HoistedHookArgs;
   // Compute arguments for coalesced instrumentation hoisted to before the loop.
-  for (Instruction *I : LoopInstToHoist) {
+  for (Instruction *I : inProgramOrder(LoopInstToHoist)) {
     // Get the insertion point in the preheader of the loop.
     Loop *L = LI.getLoopFor(I->getParent());
     assert(L->getLoopPreheader() && "No preheader for loop");
@@ -2956,6 +3291,36 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
     HoistedHookArgs[I] = std::make_pair(AddrVal, RangeVal);
   }
 
+  // Addresses for the checks hoisted before loop nests, and for symbolic
+  // nests, lengths and rows.
+  SmallVector<Value *, 8> NestAddrs;
+  SmallVector<Value *, 8> NestLens;
+  SmallVector<SmallVector<std::pair<Value *, Value *>, 2>, 8> NestRows;
+  for (auto &NC : CilkSanImpl.NestChecks) {
+    if (NC.AddrV) {
+      NestAddrs.push_back(NC.AddrV);
+      NestLens.push_back(NC.LenV);
+      NestRows.push_back(NC.RowsV);
+      continue;
+    }
+    Instruction *InsertPt =
+        NC.At ? NC.At
+              : getLoopBlockInsertPt(NC.O->getLoopPreheader(),
+                                     CilkSanImpl.CsanBeforeLoop,
+                                     /*AfterHook*/ false);
+    SCEVExpander Expander(*SE, CilkSanImpl.M.getDataLayout(), "cilksan");
+    NestAddrs.push_back(Expander.expandCodeFor(
+        NC.Addr, PointerType::getUnqual(CilkSanImpl.M.getContext()), InsertPt));
+    Type *I64 = Type::getInt64Ty(CilkSanImpl.M.getContext());
+    NestLens.push_back(
+        NC.LenS ? Expander.expandCodeFor(NC.LenS, I64, InsertPt) : nullptr);
+    SmallVector<std::pair<Value *, Value *>, 2> Rows;
+    for (auto [Step, N] : NC.Rows)
+      Rows.push_back({Expander.expandCodeFor(Step, I64, InsertPt),
+                      Expander.expandCodeFor(N, I64, InsertPt)});
+    NestRows.push_back(std::move(Rows));
+  }
+
   // Map pairs of instruction and loop-exit to address and range arguments for
   // coalesced instrumentation.
   DenseMap<std::pair<Instruction *, BasicBlock *>, std::pair<Value *, Value *>>
@@ -2963,7 +3328,7 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
   // Map to track which loops we have already created counters for
   SmallMapVector<Loop*, Value*, 8> LoopToCounterMap;
   // Compute arguments for coalesced instrumentation sunk after the loop.
-  for (Instruction *I : LoopInstToSink) {
+  for (Instruction *I : inProgramOrder(LoopInstToSink)) {
     // Get the loop
     Loop *L = LI.getLoopFor(I->getParent());
 
@@ -3053,7 +3418,7 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
   // later, such as atomics and memory intrinsics.
 
   // Insert coalesced instrumentation hoisted before the loop.
-  for (Instruction *I : LoopInstToHoist) {
+  for (Instruction *I : inProgramOrder(LoopInstToHoist)) {
     LLVM_DEBUG(dbgs() << "Loop instruction for hoisting instrumentation: " << *I
                       << "\n");
 
@@ -3110,8 +3475,134 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
     Result = true;
   }
 
+  // Insert the checks hoisted before loop nests. A nest's runs of one kind
+  // share their representative access, which is registered once.
+  DenseMap<Instruction *, uint64_t> NestIds;
+  for (size_t N = 0; N < CilkSanImpl.NestChecks.size(); ++N) {
+    auto &NC = CilkSanImpl.NestChecks[N];
+    Instruction *I = NC.Rep;
+    uint64_t LocalId;
+    if (auto It = NestIds.find(I); It != NestIds.end()) {
+      LocalId = It->second;
+      if (isa<LoadInst>(I))
+        ++NumHoistedInstrumentedReads;
+      else
+        ++NumHoistedInstrumentedWrites;
+    } else if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+      LocalId = CilkSanImpl.LoadFED.add(*LI);
+      uint64_t ObjId = CilkSanImpl.LoadObj.add(
+          *LI,
+          CilkSanImpl.lookupUnderlyingObject(getLoadStorePointerOperand(LI)));
+      assert(LocalId == ObjId &&
+             "Load received different ID's in FED and object tables.");
+      (void)ObjId;
+      ++NumHoistedInstrumentedReads;
+    } else {
+      StoreInst *SI = cast<StoreInst>(I);
+      LocalId = CilkSanImpl.StoreFED.add(*SI);
+      uint64_t ObjId = CilkSanImpl.StoreObj.add(
+          *SI,
+          CilkSanImpl.lookupUnderlyingObject(getLoadStorePointerOperand(SI)));
+      assert(LocalId == ObjId &&
+             "Store received different ID's in FED and object tables.");
+      (void)ObjId;
+      ++NumHoistedInstrumentedWrites;
+    }
+    NestIds[I] = LocalId;
+    Instruction *InsertPt =
+        NC.At ? NC.At
+              : getLoopBlockInsertPt(NC.O->getLoopPreheader(),
+                                     CilkSanImpl.CsanBeforeLoop,
+                                     /*AfterLoop*/ false);
+    IRBuilder<> IRB(InsertPt);
+    if (!NC.Preds.empty()) {
+      // The accesses run only when the nest's guarding conditions hold.
+      Value *Guard = IRB.getTrue();
+      for (auto [Cond, Dir] : NC.Preds)
+        Guard = IRB.CreateAnd(Guard, Dir ? Cond : IRB.CreateNot(Cond));
+      InsertPt = SplitBlockAndInsertIfThen(Guard, InsertPt, false, nullptr,
+                                           &DTU, &LI);
+      IRB.SetInsertPoint(InsertPt);
+    }
+    if (MAAPChecks) {
+      // Skip the check only when every access it covers could skip its own.
+      Value *RepChk = getMAAPCheck(I, IRB);
+      Value *MAAPChk = IRB.getTrue();
+      for (Instruction *M : NC.Members) {
+        Value *Chk = M == I ? RepChk : getMAAPCheck(M, IRB);
+        if (Chk == IRB.getFalse()) {
+          MAAPChk = Chk;
+          break;
+        }
+        MAAPChk = IRB.CreateAnd(MAAPChk, Chk);
+      }
+      if (RepChk != IRB.getFalse()) {
+        if (MAAPChk == IRB.getFalse())
+          ++NumMergedMAAPLost;
+        if (auto *RI = dyn_cast<Instruction>(RepChk); RI && RI->use_empty())
+          RecursivelyDeleteTriviallyDeadInstructions(RI);
+      }
+      if (MAAPChk != IRB.getFalse()) {
+        ++NumMergedMAAPGuarded;
+        Instruction *CheckTerm =
+            SplitBlockAndInsertIfThen(IRB.CreateICmpEQ(MAAPChk, IRB.getFalse()),
+                                      InsertPt, false, nullptr, &DTU, &LI);
+        IRB.SetInsertPoint(CheckTerm);
+      }
+    }
+    IRB.SetCurrentDebugLocation(searchForDebugLoc(I));
+    Value *Addr = NestAddrs[N];
+    Value *Len = NestLens[N] ? NestLens[N] : IRB.getInt64(NC.Len);
+    // Rows of a symbolic nest: a loop per row dimension, each running at
+    // least once (every loop in the nest does). The label fetch comes first,
+    // since TaskInfo doesn't know the new blocks.
+    CallInst *Label = nullptr;
+    if (!NestRows[N].empty() &&
+        (isa<LoadInst>(I) ? CilkSanImpl.LargeLoadTakesLabel
+                          : CilkSanImpl.LargeStoreTakesLabel))
+      Label = CilkSanImpl.getCurOSLabelCall(IRB);
+    for (auto [Step, Count] : NestRows[N]) {
+      BasicBlock *Pre = IRB.GetInsertBlock();
+      Instruction *SplitPt = &*IRB.GetInsertPoint();
+      BasicBlock *Exit = SplitBlock(Pre, SplitPt, &DTU, &LI, nullptr,
+                                    "cilksan.rows.exit");
+      LLVMContext &Ctx = Pre->getContext();
+      BasicBlock *Body = BasicBlock::Create(Ctx, "cilksan.rows", Pre->getParent(),
+                                            Exit);
+      Pre->getTerminator()->setSuccessor(0, Body);
+      IRBuilder<> BIRB(Body);
+      BIRB.SetCurrentDebugLocation(IRB.getCurrentDebugLocation());
+      PHINode *Idx = BIRB.CreatePHI(BIRB.getInt64Ty(), 2, "cilksan.row");
+      Idx->addIncoming(BIRB.getInt64(0), Pre);
+      Value *Next = BIRB.CreateAdd(Idx, BIRB.getInt64(1));
+      BranchInst *Back = BIRB.CreateCondBr(BIRB.CreateICmpULT(Next, Count),
+                                           Body, Exit);
+      Idx->addIncoming(Next, Body);
+      DTU.applyUpdates({{DominatorTree::Insert, Pre, Body},
+                        {DominatorTree::Insert, Body, Body},
+                        {DominatorTree::Insert, Body, Exit},
+                        {DominatorTree::Delete, Pre, Exit}});
+      Loop *RowLoop = LI.AllocateLoop();
+      if (Loop *Parent = LI.getLoopFor(Pre))
+        Parent->addChildLoop(RowLoop);
+      else
+        LI.addTopLevelLoop(RowLoop);
+      RowLoop->addBasicBlockToLoop(Body, LI);
+      IRB.SetInsertPoint(Back);
+      Addr = IRB.CreateGEP(IRB.getInt8Ty(), Addr, IRB.CreateMul(Idx, Step));
+    }
+    // A run can start at a lower alignment than Rep's, so claim none: the
+    // runtime's fast path trusts an access no larger than its alignment not
+    // to cross an alignment boundary.
+    CilkSanImpl.LabelOverride = Label;
+    CilkSanImpl.instrumentLoadOrStoreHoisted(I, Addr, Len, IRB, LocalId,
+                                             Align(1));
+    CilkSanImpl.LabelOverride = nullptr;
+    Result = true;
+  }
+
   // Insert coalesced instrumentation sunk after the loop.
-  for (Instruction *I : LoopInstToSink) {
+  for (Instruction *I : inProgramOrder(LoopInstToSink)) {
     LLVM_DEBUG(dbgs() << "Loop instruction for sinking instrumentation: " << *I
                       << "\n");
     Loop *L = LI.getLoopFor(I->getParent());
@@ -3192,13 +3683,14 @@ bool CilkSanitizerImpl::Instrumentor::instrumentLoops(
 bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
                                                      Value *Addr, Value *Size,
                                                      IRBuilder<> &IRB,
-                                                     uint64_t LocalId) {
+                                                     uint64_t LocalId,
+                                                     MaybeAlign Alignment) {
   // The caller of this method is guaranteed to have computed the Addr and Size
   // values with the right type for the hook, so no additional type conversions
   // are needed.
   CsiLoadStoreProperty Prop;
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
-    Prop.setAlignment(MaybeAlign(LI->getAlign()));
+    Prop.setAlignment(Alignment ? Alignment : MaybeAlign(LI->getAlign()));
     Prop.setIsThreadLocal(isThreadLocalObject(lookupUnderlyingObject(Addr)));
     // Instrument the load
     Value *CsiId = LoadFED.localToGlobalId(LocalId, IRB);
@@ -3210,7 +3702,7 @@ bool CilkSanitizerImpl::instrumentLoadOrStoreHoisted(Instruction *I,
     Instruction *Call = IRB.CreateCall(CsanLargeRead, Args);
     IRB.SetInstDebugLocation(Call);
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
-    Prop.setAlignment(SI->getAlign());
+    Prop.setAlignment(Alignment ? Alignment : MaybeAlign(SI->getAlign()));
     Prop.setIsThreadLocal(isThreadLocalObject(lookupUnderlyingObject(Addr)));
     // Instrument the store
     Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
@@ -3285,6 +3777,8 @@ static void setInstrumentationDebugLoc(Function &Instrumented,
 }
 
 CallInst *CilkSanitizerImpl::getCurOSLabelCall(IRBuilder<> &IRB) {
+  if (LabelOverride)
+    return LabelOverride;
   BasicBlock *BB = IRB.GetInsertBlock();
   const BasicBlock *Key = BB;
   BasicBlock *InsertBB = nullptr;
@@ -3317,7 +3811,20 @@ CallInst *CilkSanitizerImpl::getCurOSLabelCall(IRBuilder<> &IRB) {
       // node for BB yet. Entry dominating Known implies it dominates BB, since
       // BB is reached from Known through the unique-predecessor chain above.
       BasicBlock *Entry = S->getEntry();
-      if (Entry && CurDomTree->dominates(Entry, Known)) {
+      // A spindle can run from a Tapir loop's latch (the continuation of its
+      // detach) out through the loop exit, e.g. into a strip-mined loop's
+      // serial epilog. Loop spawning outlines the loop later, so a label call
+      // at an entry inside the loop must not serve a use outside it.
+      auto LeavesTapirLoop = [&](BasicBlock *From, BasicBlock *To) {
+        if (!CurLoopInfo)
+          return false;
+        for (Loop *L = CurLoopInfo->getLoopFor(From); L; L = L->getParentLoop())
+          if (!L->contains(To) && getTaskIfTapirLoopStructure(L, CurTaskInfo))
+            return true;
+        return false;
+      };
+      if (Entry && CurDomTree->dominates(Entry, Known) &&
+          !LeavesTapirLoop(Entry, Known)) {
         Key = Entry;
         InsertBB = Entry;
       }
@@ -3348,11 +3855,1190 @@ CallInst *CilkSanitizerImpl::getCurOSLabelCall(IRBuilder<> &IRB) {
     EntryIRB.SetCurrentDebugLocation(DL);
     Call = EntryIRB.CreateCall(GetCurOSLabel);
   } else {
-    Call = IRB.CreateCall(GetCurOSLabel);
+    // Not hoisted: fetch at the top of BB, so that the cached call dominates
+    // every later use in BB. Uses are not instrumented in program order: K
+    // emits a coalesced check after the last access it covers, before the
+    // accesses in front of it (in the same block) are instrumented.
+    IRBuilder<> TopIRB(BB, BB->getFirstInsertionPt());
+    TopIRB.SetCurrentDebugLocation(IRB.getCurrentDebugLocation());
+    Call = TopIRB.CreateCall(GetCurOSLabel);
   }
   Call->setCallingConv(CallingConv::PreserveMost);
   SpindleLabelCache[Key] = Call;
   return Call;
+}
+
+// Loop nests checked as a whole (see HoistNests). Nest O qualifies if it runs
+// in one strand -- it is serial, holds no detach, reattach or sync, and calls
+// nothing that might race -- and every loop in it has one exit, a constant
+// trip count and, if it is not O, runs on every iteration of its parent. An
+// access in O is covered if it runs on every iteration of its loop and its
+// address is affine in the indices of its loops up to O, with constant steps,
+// from a base fixed on entry to O. The bytes such accesses touch, from bases
+// that differ by constants, are then known exactly: they are enumerated, and
+// one check before O covers each run of written bytes, and of bytes read but
+// not written (the strand's write covers its read). The order of checks
+// within the strand doesn't change what they find. Accesses that don't
+// qualify are checked as before.
+void CilkSanitizerImpl::planNestChecks(LoopInfo &LI, ScalarEvolution &SE,
+                                       DominatorTree &DT, TaskInfo &TI,
+                                       RaceInfo &RI,
+                                       SmallPtrSetImpl<Instruction *> &Covered) {
+  // Outermost first: a qualifying nest's subloops are not tried on their own.
+  SmallVector<Loop *, 8> Work(LI.begin(), LI.end());
+  while (!Work.empty()) {
+    Loop *O = Work.pop_back_val();
+    if (!tryNest(O, LI, SE, DT, TI, RI, Covered))
+      Work.append(O->begin(), O->end());
+  }
+}
+
+// Why the checks of nest O can't move before it, as for a nest that runs in
+// one strand, or null if they can: O needs a preheader, must run in one strand
+// (isSerialStrandLoop), and must call nothing that might race.
+const char *CilkSanitizerImpl::whyNotOneStrand(const Loop *O, TaskInfo &TI) {
+  if (!O->getLoopPreheader() || !isSerialStrandLoop(O, TI))
+    return "no preheader or not one strand";
+  for (const BasicBlock *BB : O->blocks())
+    for (const Instruction &I : *BB)
+      // Intrinsics that touch no memory (fmuladd, umin, ...) are arithmetic.
+      if (isa<CallBase>(I) && !isa<DbgInfoIntrinsic>(I) &&
+          !(isa<IntrinsicInst>(I) && !I.mayReadOrWriteMemory()) &&
+          !simpleCallCannotRace(I)) {
+        LLVM_DEBUG(dbgs() << "  call: " << I << "\n");
+        return "calls something that might race";
+      }
+  return nullptr;
+}
+
+// Checks the exact footprint of accesses As, whose offsets are from Base,
+// for a nest (O, checks before it) or a straight-line stretch (O null, checks
+// at At): one check per run of bytes written, and of bytes read but not
+// written. A straight-line access is the zero-dimension case. The check of a
+// run reports the first (FirstRep) or last access of its kind, and its
+// members are the accesses with a byte in it, in order. Returns the number of
+// checks, or 0, adding none, if the footprint spans more than MaxSpan bytes,
+// marks more than MaxMarks instances or has more than MaxRuns runs.
+unsigned CilkSanitizerImpl::coverClass(ArrayRef<FootprintAccess> As,
+                                       ScalarEvolution &SE, const SCEV *Base,
+                                       Loop *O, Instruction *At, bool FirstRep,
+                                       int64_t MaxSpan, uint64_t MaxMarks,
+                                       unsigned MaxRuns) {
+  int64_t Lo = INT64_MAX, Hi = INT64_MIN;
+  uint64_t Marks = 0;
+  for (const FootprintAccess &A : As) {
+    int64_t ALo = A.Off, AHi = A.Off + A.Size;
+    uint64_t N = 1;
+    for (auto [Step, T] : A.Steps) {
+      int64_t Ext = Step * int64_t(T - 1);
+      (Ext < 0 ? ALo : AHi) += Ext;
+      N *= T;
+    }
+    Lo = std::min(Lo, ALo);
+    Hi = std::max(Hi, AHi);
+    Marks += N;
+  }
+  if (Hi - Lo > MaxSpan || Marks > MaxMarks) {
+    LLVM_DEBUG(dbgs() << "  class too large: span " << (Hi - Lo) << "\n");
+    return 0;
+  }
+  // Calls Fn with the offset from Lo of each instance of A.
+  auto ForEachInstance = [&](const FootprintAccess &A,
+                             function_ref<void(int64_t)> Fn) {
+    SmallVector<unsigned, 4> Idx(A.Steps.size(), 0);
+    for (;;) {
+      int64_t Off = A.Off - Lo;
+      for (size_t k = 0; k < Idx.size(); ++k)
+        Off += A.Steps[k].first * int64_t(Idx[k]);
+      Fn(Off);
+      size_t k = 0;
+      for (; k < Idx.size(); ++k) {
+        if (++Idx[k] < A.Steps[k].second)
+          break;
+        Idx[k] = 0;
+      }
+      if (k == Idx.size())
+        break;
+    }
+  };
+  // Bytes read (1) and written (2), from Lo.
+  std::vector<uint8_t> Map(Hi - Lo, 0);
+  for (const FootprintAccess &A : As) {
+    uint8_t Bit = isa<StoreInst>(A.I) ? 2 : 1;
+    ForEachInstance(A, [&](int64_t Off) {
+      for (int64_t b = 0; b < A.Size; ++b)
+        Map[Off + b] |= Bit;
+    });
+  }
+  SmallVector<ByteRun, 8> Runs = byteMapRuns(Map);
+  if (Runs.size() > MaxRuns) {
+    LLVM_DEBUG(dbgs() << "  class has " << Runs.size() << " runs\n");
+    return 0;
+  }
+  Instruction *RepR = nullptr, *RepW = nullptr;
+  for (const FootprintAccess &A : As) {
+    Instruction *&Rep = isa<StoreInst>(A.I) ? RepW : RepR;
+    if (!FirstRep || !Rep)
+      Rep = A.I;
+  }
+  // The run of each byte, and the accesses with a byte in each run.
+  std::vector<int32_t> RunOf(Hi - Lo, -1);
+  for (size_t r = 0; r < Runs.size(); ++r)
+    for (int64_t b = 0; b < std::get<1>(Runs[r]); ++b)
+      RunOf[std::get<0>(Runs[r]) + b] = r;
+  SmallVector<SmallSetVector<Instruction *, 4>, 8> RunMembers(Runs.size());
+  for (const FootprintAccess &A : As)
+    ForEachInstance(A, [&](int64_t Off) {
+      for (int64_t b = 0; b < A.Size; ++b)
+        RunMembers[RunOf[Off + b]].insert(A.I);
+    });
+  for (size_t r = 0; r < Runs.size(); ++r) {
+    auto [B, N, W] = Runs[r];
+    const SCEV *Addr = SE.getAddExpr(
+        Base, SE.getConstant(SE.getEffectiveSCEVType(Base->getType()), Lo + B,
+                             /*isSigned=*/true));
+    NestChecks.push_back({W ? RepW : RepR, O, Addr, uint64_t(N), At});
+    NestChecks.back().Members.append(RunMembers[r].begin(),
+                                     RunMembers[r].end());
+  }
+  return Runs.size();
+}
+
+bool CilkSanitizerImpl::tryNest(Loop *O, LoopInfo &LI, ScalarEvolution &SE,
+                                DominatorTree &DT, TaskInfo &TI, RaceInfo &RI,
+                                SmallPtrSetImpl<Instruction *> &Covered) {
+  auto Reject = [&](const char *Why) {
+    LLVM_DEBUG(dbgs() << "Loop nest " << O->getHeader()->getName() << " in "
+                      << O->getHeader()->getParent()->getName() << ": " << Why
+                      << "\n");
+    return false;
+  };
+  if (const char *Why = whyNotOneStrand(O, TI))
+    return Reject(Why);
+  // Every loop: one exit, a constant trip count, and for an inner loop, a
+  // preheader that runs on every iteration of its parent.
+  SmallVector<Loop *, 8> Loops = O->getLoopsInPreorder();
+  DenseMap<const Loop *, unsigned> Trips;
+  for (Loop *L : Loops) {
+    unsigned T = SE.getSmallConstantTripCount(L);
+    if (!T || !L->getExitingBlock() || !L->getLoopPreheader())
+      return Reject("a loop without a constant trip count or one exit");
+    Trips[L] = T;
+    if (L != O) {
+      ICFLoopSafetyInfo PSI;
+      PSI.computeLoopSafetyInfo(L->getParentLoop());
+      if (!PSI.isGuaranteedToExecute(*L->getLoopPreheader()->getTerminator(),
+                                     &DT, &TI, L->getParentLoop()))
+        return Reject("an inner loop that doesn't run on every iteration");
+    }
+  }
+
+  // The accesses to cover, by base (up to a constant).
+  struct Class {
+    const SCEV *Base;
+    SmallVector<FootprintAccess, 8> Accesses;
+  };
+  SmallVector<Class, 4> Classes;
+  DenseMap<const Loop *, std::unique_ptr<ICFLoopSafetyInfo>> SafetyInfos;
+  for (Loop *L : Loops) {
+    auto SI = std::make_unique<ICFLoopSafetyInfo>();
+    SI->computeLoopSafetyInfo(L);
+    SafetyInfos[L] = std::move(SI);
+  }
+  for (BasicBlock *BB : O->blocks()) {
+    Loop *Inner = LI.getLoopFor(BB);
+    for (Instruction &I : *BB) {
+      std::optional<int64_t> Size = hoistableAccessSize(I, RI, SE);
+      if (!Size ||
+          !SafetyInfos[Inner]->isGuaranteedToExecute(I, &DT, &TI, Inner))
+        continue;
+      // Peel one affine level per loop from Inner up to O.
+      const SCEV *V = SE.getSCEV(getLoadStorePointerOperand(&I));
+      FootprintAccess A{&I, 0, *Size, {}};
+      bool OK = true;
+      for (Loop *L = Inner;; L = L->getParentLoop()) {
+        if (const auto *AR = dyn_cast<SCEVAddRecExpr>(V);
+            AR && AR->getLoop() == L) {
+          const auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+          if (!AR->isAffine() || !Step ||
+              Step->getAPInt().getSignificantBits() > 32) {
+            OK = false;
+            break;
+          }
+          A.Steps.push_back({Step->getAPInt().getSExtValue(), Trips[L]});
+          V = AR->getStart();
+        } else if (!SE.isLoopInvariant(V, L)) {
+          OK = false;
+          break;
+        }
+        if (L == O)
+          break;
+      }
+      if (!OK || !SE.isLoopInvariant(V, O) || !SE.isAvailableAtLoopEntry(V, O)) {
+        LLVM_DEBUG(dbgs() << "  not affine with a fixed base: " << I << "\n");
+        continue;
+      }
+      Class *C = nullptr;
+      for (Class &K : Classes)
+        if (std::optional<int64_t> Off = constOffset(SE, V, K.Base)) {
+          A.Off = *Off;
+          C = &K;
+          break;
+        }
+      if (!C) {
+        Classes.push_back({V, {}});
+        C = &Classes.back();
+      }
+      C->Accesses.push_back(std::move(A));
+    }
+  }
+
+  // Each class's exact footprint, as runs.
+  bool Any = false;
+  for (Class &K : Classes) {
+    unsigned Checks = coverClass(K.Accesses, SE, K.Base, O, /*At=*/nullptr,
+                                 /*FirstRep=*/false, int64_t(1) << 20,
+                                 uint64_t(1) << 22, /*MaxRuns=*/32);
+    if (!Checks)
+      continue;
+    for (FootprintAccess &A : K.Accesses)
+      Covered.insert(A.I);
+    NumNestChecks += Checks;
+    NumNestAccesses += K.Accesses.size();
+    Any = true;
+    LLVM_DEBUG(dbgs() << "Hoisting " << Checks << " checks for "
+                      << K.Accesses.size() << " accesses before loop nest "
+                      << O->getHeader()->getName() << "\n");
+  }
+  return Any;
+}
+
+// Loop nests with symbolic bounds (see HoistSymbolicNests). As for tryNest,
+// nest O runs in one strand and every loop in it has one exit, but a trip
+// count need only be fixed on entry to O: each loop's backedge-taken count is
+// invariant in O. An inner loop's preheader, and every covered access, must
+// dominate the exiting block of its loop, so it runs exactly once per
+// iteration, and every loop runs at least once whenever O is entered. An
+// access is covered if its address is affine in the indices of its loops up
+// to O, with steps and base fixed on entry to O. Its footprint is then a
+// set of rows: dimensions whose step is at most the extent built so far
+// (provably, as a constant, or by being equal to it) widen one contiguous
+// range, and up to two others become loops of checks. Every checked byte is
+// one the access touches, so the checks are exact, and as before their order
+// within the strand doesn't change what they find. An access whose
+// footprint doesn't shrink this way is checked as before.
+//
+// Finds the footprints of the accesses SizeOf gives a size for (in Prints),
+// and for each access, how many versions of its loop it has (NumVersions;
+// see LoopState). Returns false, finding none, if O doesn't qualify.
+bool CilkSanitizerImpl::symbolicFootprints(
+    Loop *O, LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT,
+    TaskInfo &TI, function_ref<std::optional<int64_t>(Instruction &)> SizeOf,
+    SmallVectorImpl<SymFootprint> &Prints,
+    DenseMap<Instruction *, unsigned> &NumVersions) {
+  auto Reject = [&](const char *Why) {
+    LLVM_DEBUG(dbgs() << "Symbolic nest " << O->getHeader()->getName()
+                      << " in " << O->getHeader()->getParent()->getName()
+                      << ": " << Why << "\n");
+    return false;
+  };
+  if (const char *Why = whyNotOneStrand(O, TI))
+    return Reject(Why);
+  Type *I64 = Type::getInt64Ty(O->getHeader()->getContext());
+  // A value fixed on entry to O: defined before it.
+  Instruction *Entry = O->getLoopPreheader()->getTerminator();
+  auto FixedOnEntry = [&](Value *V) {
+    auto *I = dyn_cast<Instruction>(V);
+    return !I || (!O->contains(I) && DT.dominates(I, Entry));
+  };
+  // A condition computed in O from values fixed on entry, by instructions
+  // without side effects (a select of two checks, say), is itself fixed on
+  // entry: clone its computation before O. Returns null if it isn't.
+  DenseMap<Value *, Value *> Hoisted;
+  std::function<Value *(Value *, unsigned)> HoistCond = [&](Value *V,
+                                                            unsigned Depth) {
+    if (FixedOnEntry(V))
+      return V;
+    if (auto It = Hoisted.find(V); It != Hoisted.end())
+      return It->second;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || Depth > 4 || isa<PHINode>(I) || I->mayReadOrWriteMemory() ||
+        !isSafeToSpeculativelyExecute(I))
+      return (Value *)nullptr;
+    SmallVector<Value *, 4> Ops;
+    for (Value *Op : I->operands()) {
+      Value *H = HoistCond(Op, Depth + 1);
+      if (!H)
+        return (Value *)nullptr;
+      Ops.push_back(H);
+    }
+    Instruction *C = I->clone();
+    for (unsigned k = 0; k < Ops.size(); ++k)
+      C->setOperand(k, Ops[k]);
+    C->insertBefore(Entry->getIterator());
+    C->setName(I->getName() + ".cilksan");
+    Hoisted[V] = C;
+    return (Value *)C;
+  };
+  // Expanding a SCEV before O mustn't divide by a value that may be zero.
+  auto SafeToExpand = [&](const SCEV *S) {
+    return !SCEVExprContains(S, [](const SCEV *X) {
+      const auto *D = dyn_cast<SCEVUDivExpr>(X);
+      return D && !isa<SCEVConstant>(D->getRHS());
+    });
+  };
+  SmallVector<Loop *, 8> Loops = O->getLoopsInPreorder();
+  DenseMap<const Loop *, std::unique_ptr<ICFLoopSafetyInfo>> SafetyInfos;
+  for (Loop *L : Loops) {
+    auto SI = std::make_unique<ICFLoopSafetyInfo>();
+    SI->computeLoopSafetyInfo(L);
+    SafetyInfos[L] = std::move(SI);
+  }
+  using PredList = SmallVector<std::pair<Value *, bool>, 2>;
+  // Conditions as an OR of exclusive clauses, each an AND of branch
+  // conditions fixed on entry to O.
+  using DNF = SmallVector<PredList, 2>;
+  constexpr size_t kMaxClauses = 8;
+  // A clause and'ed with another, or none if they contradict each other.
+  auto Conj = [](const PredList &A, const PredList &B) -> std::optional<PredList> {
+    PredList R = A;
+    for (auto Lit : B) {
+      auto It = find_if(R, [&](auto &X) { return X.first == Lit.first; });
+      if (It == R.end())
+        R.push_back(Lit);
+      else if (It->second != Lit.second)
+        return std::nullopt;
+    }
+    return R;
+  };
+  // Merges clauses that differ only in one condition's sense (A and c, A and
+  // !c) into one (A), until none do: the exits of an unrolled vector loop,
+  // one per possible trip count, together leave whenever it was entered.
+  auto Simplify = [](DNF &R) {
+    for (bool Changed = true; Changed;) {
+      Changed = false;
+      for (size_t a = 0; a < R.size() && !Changed; ++a)
+        for (size_t b = a + 1; b < R.size() && !Changed; ++b) {
+          if (R[a].size() != R[b].size())
+            continue;
+          int Diff = -1;
+          bool OK = true;
+          for (size_t k = 0; k < R[a].size() && OK; ++k) {
+            auto It = find_if(R[b], [&](auto &X) {
+              return X.first == R[a][k].first;
+            });
+            if (It == R[b].end())
+              OK = false;
+            else if (It->second != R[a][k].second) {
+              if (Diff >= 0)
+                OK = false;
+              Diff = k;
+            }
+          }
+          if (!OK || Diff < 0)
+            continue;
+          R[a].erase(R[a].begin() + Diff);
+          R.erase(R.begin() + b);
+          Changed = true;
+        }
+    }
+  };
+  // The conditions under which BB, in loop L, runs on an iteration of L (at
+  // most once, as a block outside L's subloops): none if it always does.
+  // Otherwise, exactly when one of the edges into it is taken; an edge from a
+  // block of L is taken when that block runs and its branch goes this way,
+  // and the edge out of a subloop with one exit when the subloop's preheader
+  // runs (its trip count is known, so it ends). (The vectorizer leaves such
+  // blocks when it unrolls a vector loop with a small symbolic trip count,
+  // and around its epilogues.)
+  DenseMap<BasicBlock *, std::optional<DNF>> BlockMemo;
+  std::function<std::optional<DNF>(BasicBlock *, Loop *, unsigned)> BlockPreds;
+  std::function<std::optional<DNF>(BasicBlock *, BasicBlock *, Loop *,
+                                   unsigned)>
+      EdgePreds;
+  BlockPreds = [&](BasicBlock *BB, Loop *L,
+                   unsigned Depth) -> std::optional<DNF> {
+    if (auto It = BlockMemo.find(BB); It != BlockMemo.end())
+      return It->second;
+    std::optional<DNF> R;
+    if (SafetyInfos[L]->isGuaranteedToExecute(*BB->getTerminator(), &DT, &TI,
+                                              L) &&
+        DT.dominates(BB, L->getExitingBlock())) {
+      R = DNF{PredList{}};
+    } else if (Depth < 32 && BB != L->getHeader()) {
+      R = DNF{};
+      SmallPtrSet<BasicBlock *, 4> Seen;
+      for (BasicBlock *Q : predecessors(BB)) {
+        if (!Seen.insert(Q).second)
+          continue;
+        auto E = EdgePreds(Q, BB, L, Depth + 1);
+        if (!E || R->size() + E->size() > 8 * kMaxClauses) {
+          R = std::nullopt;
+          break;
+        }
+        R->append(E->begin(), E->end());
+      }
+      if (R) {
+        Simplify(*R);
+        if (R->size() > kMaxClauses)
+          R = std::nullopt;
+      }
+    }
+    BlockMemo[BB] = R;
+    return R;
+  };
+  EdgePreds = [&](BasicBlock *Q, BasicBlock *BB, Loop *L,
+                  unsigned Depth) -> std::optional<DNF> {
+    if (!L->contains(Q))
+      return std::nullopt;
+    if (Loop *Sub = LI.getLoopFor(Q); Sub != L) {
+      while (Sub->getParentLoop() != L)
+        Sub = Sub->getParentLoop();
+      if (Sub->getExitingBlock() != Q || Sub->getUniqueExitBlock() != BB ||
+          !Sub->getLoopPreheader() ||
+          !SE.hasLoopInvariantBackedgeTakenCount(Sub))
+        return std::nullopt;
+      return BlockPreds(Sub->getLoopPreheader(), L, Depth);
+    }
+    auto *Br = dyn_cast<BranchInst>(Q->getTerminator());
+    if (!Br)
+      return std::nullopt;
+    auto P = BlockPreds(Q, L, Depth);
+    if (!P || !Br->isConditional() || Br->getSuccessor(0) == Br->getSuccessor(1))
+      return P;
+    Value *Cond = HoistCond(Br->getCondition(), 0);
+    if (!Cond)
+      return std::nullopt;
+    DNF R;
+    for (PredList &C : *P)
+      if (auto D = Conj(C, PredList{{Cond, Br->getSuccessor(0) == BB}}))
+        R.push_back(std::move(*D));
+    return R;
+  };
+  // Each loop that runs once on every iteration of its parent, at least
+  // when some branch conditions fixed on entry to O go one way, has one
+  // version per way in: the conditions under which it is entered that way
+  // (exactly those, so they hold on every iteration of the parent or on
+  // none), the values its preheader's phis then take (Map), and the trip
+  // counts of it and its ancestors up to O. The vectorizer leaves loops like
+  // this: a scalar loop entered from its runtime checks with a start of 0,
+  // or after the vector loop, as its remainder.
+  struct LoopState {
+    PredList Preds;
+    ValueToSCEVMapTy Map;
+    DenseMap<const Loop *, const SCEV *> Trips;
+    // Whether some way into this loop or an ancestor has no version, so the
+    // loop may also run when no version's conditions hold.
+    bool Partly = false;
+  };
+  constexpr size_t kMaxVersions = 8;
+  DenseMap<const Loop *, SmallVector<LoopState, 2>> States;
+  for (Loop *L : Loops) {
+    BasicBlock *PH = L->getLoopPreheader();
+    if (!L->getExitingBlock() || !PH) {
+      if (L == O)
+        return Reject("a loop without one exit");
+      continue;
+    }
+    SmallVector<LoopState, 2> Vs;
+    if (L == O) {
+      Vs.emplace_back();
+    } else {
+      Loop *P = L->getParentLoop();
+      auto PIt = States.find(P);
+      if (PIt == States.end())
+        continue;
+      for (LoopState &PV : PIt->second) {
+        // A preheader with one way in (or the parent's header) has no phis
+        // to resolve: its own conditions give the versions.
+        if (PH == P->getHeader() || PH->getUniquePredecessor()) {
+          auto Bp = BlockPreds(PH, P, 0);
+          if (!Bp)
+            continue;
+          for (PredList &D : *Bp)
+            if (auto C = Conj(PV.Preds, D)) {
+              LoopState V = PV;
+              V.Preds = std::move(*C);
+              Vs.push_back(std::move(V));
+            }
+          continue;
+        }
+        bool All = true;
+        size_t First = Vs.size();
+        SmallPtrSet<BasicBlock *, 4> Seen;
+        for (BasicBlock *Pd : predecessors(PH)) {
+          if (!Seen.insert(Pd).second)
+            continue;
+          auto E = EdgePreds(Pd, PH, P, 0);
+          if (!E) {
+            All = false;
+            continue;
+          }
+          for (PredList &D : *E) {
+            auto C = Conj(PV.Preds, D);
+            if (!C)
+              continue;
+            LoopState V = PV;
+            V.Preds = std::move(*C);
+            for (PHINode &Phi : PH->phis())
+              if (SE.isSCEVable(Phi.getType()))
+                V.Map[&Phi] = SCEVParameterRewriter::rewrite(
+                    SE.getSCEV(Phi.getIncomingValueForBlock(Pd)), SE, PV.Map);
+            Vs.push_back(std::move(V));
+          }
+        }
+        if (!All)
+          for (size_t k = First; k < Vs.size(); ++k)
+            Vs[k].Partly = true;
+      }
+    }
+    // Each version's trip count, fixed on entry to O.
+    bool Dropped = Vs.size() > kMaxVersions;
+    if (Dropped)
+      Vs.resize(kMaxVersions);
+    SmallVector<LoopState, 2> Kept;
+    for (LoopState &V : Vs) {
+      const SCEV *BTC = SE.getBackedgeTakenCount(L);
+      if (!isa<SCEVCouldNotCompute>(BTC))
+        BTC = SCEVParameterRewriter::rewrite(BTC, SE, V.Map);
+      if (isa<SCEVCouldNotCompute>(BTC) || !SE.isLoopInvariant(BTC, O) ||
+          !SE.isAvailableAtLoopEntry(BTC, O) || !SafeToExpand(BTC) ||
+          SE.getTypeSizeInBits(BTC->getType()) > 64) {
+        if (L == O)
+          return Reject("a trip count not fixed on entry");
+        Dropped = true;
+        continue;
+      }
+      V.Trips[L] =
+          SE.getAddExpr(SE.getNoopOrZeroExtend(BTC, I64), SE.getOne(I64));
+      Kept.push_back(std::move(V));
+    }
+    if (Dropped)
+      for (LoopState &V : Kept)
+        V.Partly = true;
+    LLVM_DEBUG({
+      dbgs() << "  loop " << L->getHeader()->getName() << ": " << Kept.size()
+             << " versions" << (Dropped ? ", some dropped" : "") << "\n";
+      for (LoopState &V : Kept) {
+        dbgs() << "    " << (V.Partly ? "partly" : "fully") << " when";
+        for (auto [C, D] : V.Preds)
+          dbgs() << " " << (D ? "" : "!") << C->getName();
+        dbgs() << ", trip " << *V.Trips[L] << "\n";
+      }
+    });
+    if (!Kept.empty())
+      States[L] = std::move(Kept);
+  }
+  if (Loops.size() == 1 && isa<SCEVConstant>(States[O][0].Trips[O]))
+    return Reject("one loop with a constant trip count");
+
+  // An access before grouping: Base + [0, Size) + sum of Step_k * [0, N_k),
+  // in Depth loops.
+  struct Proto {
+    Instruction *I;
+    const SCEV *Base;
+    int64_t Size;
+    SmallVector<std::pair<const SCEV *, const SCEV *>, 4> Dims;
+    PredList Preds;
+    unsigned Depth;
+    bool Partly;
+  };
+  SmallVector<Proto, 16> Protos;
+  for (BasicBlock *BB : O->blocks()) {
+    Loop *Inner = LI.getLoopFor(BB);
+    auto StIt = States.find(Inner);
+    if (StIt == States.end())
+      continue;
+    for (Instruction &I : *BB) {
+      std::optional<int64_t> Size = SizeOf(I);
+      if (!Size)
+        continue;
+      // I runs once on every iteration of Inner, possibly under conditions
+      // fixed on entry: its block does, and nothing before it in the block
+      // can stop it.
+      if (!all_of(make_range(BB->begin(), I.getIterator()),
+                  [](Instruction &J) {
+                    return isGuaranteedToTransferExecutionToSuccessor(&J);
+                  }))
+        continue;
+      auto BPs = BlockPreds(BB, Inner, 0);
+      if (!BPs)
+        continue;
+      // Each version of Inner, under each clause of BB's conditions.
+      SmallVector<std::pair<LoopState *, PredList>, 4> Cases;
+      for (LoopState &St : StIt->second)
+        for (PredList &D : *BPs)
+          if (auto C = Conj(St.Preds, D))
+            Cases.push_back({&St, std::move(*C)});
+      NumVersions[&I] = Cases.size();
+      for (auto &[StP, CasePreds] : Cases) {
+      LoopState &St = *StP;
+      // Peel one affine level per loop from Inner up to O.
+      const SCEV *V = SCEVParameterRewriter::rewrite(
+          SE.getSCEV(getLoadStorePointerOperand(&I)), SE, St.Map);
+      SmallVector<std::pair<const SCEV *, const SCEV *>, 4> Dims;
+      bool OK = true;
+      for (Loop *L = Inner;; L = L->getParentLoop()) {
+        if (const auto *AR = dyn_cast<SCEVAddRecExpr>(V);
+            AR && AR->getLoop() == L) {
+          const SCEV *Step = AR->getStepRecurrence(SE);
+          if (!AR->isAffine() || !SE.isLoopInvariant(Step, O) ||
+              !SE.isAvailableAtLoopEntry(Step, O) || !SafeToExpand(Step) ||
+              SE.getTypeSizeInBits(Step->getType()) > 64) {
+            OK = false;
+            break;
+          }
+          Step = SE.getNoopOrSignExtend(Step, I64);
+          if (!Step->isZero())
+            Dims.push_back({Step, St.Trips.lookup(L)});
+          V = AR->getStart();
+        } else if (!SE.isLoopInvariant(V, L)) {
+          OK = false;
+          break;
+        }
+        if (L == O)
+          break;
+      }
+      if (!OK || !SE.isLoopInvariant(V, O) ||
+          !SE.isAvailableAtLoopEntry(V, O) || !SafeToExpand(V)) {
+        LLVM_DEBUG(dbgs() << "  not affine with a fixed base: " << I << "\n");
+        break;
+      }
+      // Negative constant steps walk down from the last element.
+      for (auto &[Step, N] : Dims)
+        if (const auto *C = dyn_cast<SCEVConstant>(Step);
+            C && C->getAPInt().isNegative()) {
+          V = SE.getAddExpr(
+              V, SE.getMulExpr(Step, SE.getMinusSCEV(N, SE.getOne(I64))));
+          Step = SE.getNegativeSCEV(Step);
+        }
+      Protos.push_back({&I, V, *Size, {Dims.begin(), Dims.end()}, CasePreds,
+                        LI.getLoopDepth(BB) - O->getLoopDepth() + 1,
+                        St.Partly});
+      }
+    }
+  }
+
+  // Accesses of one kind with the same steps and conditions, from bases that
+  // differ by constants, are one wider access where their bytes form one
+  // interval (the parts of a vectorized and interleaved access, say).
+  SmallVector<bool, 16> Taken(Protos.size(), false);
+  for (size_t a = 0; a < Protos.size(); ++a) {
+    if (Taken[a])
+      continue;
+    Proto &PA = Protos[a];
+    bool W = isa<StoreInst>(PA.I);
+    // Members as (offset from PA's base, size, index).
+    SmallVector<std::tuple<int64_t, int64_t, size_t>, 8> Ms;
+    for (size_t b = a; b < Protos.size(); ++b) {
+      Proto &PB = Protos[b];
+      if (Taken[b] || isa<StoreInst>(PB.I) != W || PB.Dims != PA.Dims ||
+          PB.Preds != PA.Preds || PB.Depth != PA.Depth ||
+          PB.Partly != PA.Partly)
+        continue;
+      std::optional<int64_t> Off = constOffset(SE, PB.Base, PA.Base);
+      if (!Off)
+        continue;
+      Taken[b] = true;
+      Ms.push_back({*Off, PB.Size, b});
+    }
+    llvm::sort(Ms);
+    // Each maximal run of touching intervals is one access.
+    for (size_t r = 0; r < Ms.size();) {
+      int64_t Lo = std::get<0>(Ms[r]), Hi = Lo + std::get<1>(Ms[r]);
+      size_t e = r + 1;
+      while (e < Ms.size() && std::get<0>(Ms[e]) <= Hi) {
+        Hi = std::max(Hi, std::get<0>(Ms[e]) + std::get<1>(Ms[e]));
+        ++e;
+      }
+      SmallVector<Instruction *, 4> Members;
+      for (size_t k = r; k < e; ++k)
+        Members.push_back(Protos[std::get<2>(Ms[k])].I);
+      r = e;
+      // Widen [0, Len) by every dimension whose step is at most Len. MinLen
+      // is a constant lower bound on Len (every count is at least 1).
+      const SCEV *Len = SE.getConstant(I64, Hi - Lo);
+      int64_t MinLen = Hi - Lo;
+      SmallVector<std::pair<const SCEV *, const SCEV *>, 4> Rest(PA.Dims);
+      for (bool Grew = true; Grew;) {
+        Grew = false;
+        for (auto *It = Rest.begin(); It != Rest.end(); ++It) {
+          auto [Step, N] = *It;
+          const auto *C = dyn_cast<SCEVConstant>(Step);
+          bool Fits = C ? !C->getAPInt().isNegative() &&
+                              C->getAPInt().getSExtValue() <= MinLen
+                        : SE.getMinusSCEV(Step, Len)->isZero();
+          if (!Fits)
+            continue;
+          Len = SE.getAddExpr(
+              Len, SE.getMulExpr(Step, SE.getMinusSCEV(N, SE.getOne(I64))));
+          if (C)
+            if (const auto *NC = dyn_cast<SCEVConstant>(N))
+              MinLen += C->getAPInt().getSExtValue() *
+                        (NC->getAPInt().getSExtValue() - 1);
+          Rest.erase(It);
+          Grew = true;
+          break;
+        }
+      }
+      // Worth it only if a dimension was dropped or merged, with at most two
+      // left to loop over.
+      if (Rest.size() == PA.Dims.size() && PA.Dims.size() == PA.Depth) {
+        LLVM_DEBUG(dbgs() << "  footprint doesn't shrink: " << *Members[0]
+                          << "\n");
+        continue;
+      }
+      if (Rest.size() > 2) {
+        LLVM_DEBUG(dbgs() << "  more than two rows: " << *Members[0] << "\n");
+        continue;
+      }
+      // Outermost row (largest step) first.
+      std::reverse(Rest.begin(), Rest.end());
+      const SCEV *Base = SE.getAddExpr(PA.Base, SE.getConstant(I64, Lo, true));
+      Prints.push_back({Members[0], Base, Len, {Rest.begin(), Rest.end()},
+                        PA.Preds, std::move(Members), PA.Partly});
+    }
+  }
+  if (Prints.empty())
+    return Reject("no access to cover");
+
+  // A store's checks cover a load with the same footprint.
+  auto Same = [](const SymFootprint &A, const SymFootprint &B) {
+    return A.Base == B.Base && A.Len == B.Len && A.Rows == B.Rows &&
+           A.Preds == B.Preds && A.Partly == B.Partly;
+  };
+  for (size_t a = 0; a < Prints.size(); ++a)
+    for (size_t b = 0; b < Prints.size() && !Prints[a].Dup; ++b)
+      if (b != a && Same(Prints[a], Prints[b]) &&
+          (isa<StoreInst>(Prints[b].I) > isa<StoreInst>(Prints[a].I) ||
+           (isa<StoreInst>(Prints[b].I) == isa<StoreInst>(Prints[a].I) &&
+            b < a)))
+        Prints[a].Dup = true;
+  // A check also stands for every footprint the same as its own.
+  for (SymFootprint &P : Prints) {
+    if (P.Dup)
+      continue;
+    SmallSetVector<Instruction *, 4> Members;
+    for (SymFootprint &Q : Prints)
+      if (Same(P, Q))
+        Members.insert(Q.Members.begin(), Q.Members.end());
+    P.Members.assign(Members.begin(), Members.end());
+  }
+  return true;
+}
+
+// The function footprint markers call (see placeFootprintMarkers).
+static FunctionCallee getFootprintMarker(Module &M) {
+  LLVMContext &C = M.getContext();
+  FunctionType *FnTy = FunctionType::get(
+      Type::getVoidTy(C),
+      {Type::getInt1Ty(C), PointerType::getUnqual(C), Type::getInt64Ty(C)},
+      /*isVarArg*/ true);
+  AttributeList AL;
+  AL = AL.addFnAttribute(C, Attribute::NoUnwind);
+  AL = AL.addFnAttribute(C, Attribute::WillReturn);
+  AL = AL.addFnAttribute(
+      C, Attribute::getWithMemoryEffects(C, MemoryEffects::inaccessibleMemOnly()));
+  AL = AL.addParamAttribute(
+      C, 1, Attribute::getWithCaptureInfo(C, CaptureInfo::none()));
+  return M.getOrInsertFunction(FootprintMarkerName, FnTy, AL);
+}
+
+static bool isFootprintMarker(const Instruction &I) {
+  if (const auto *CI = dyn_cast<CallInst>(&I))
+    if (const Function *Fn = CI->getCalledFunction())
+      return Fn->getName() == FootprintMarkerName;
+  return false;
+}
+
+// Footprint markers (see HoistSymbolicNests). Before the vectorizer versions,
+// widens and unrolls the loops, the footprints of each symbolic nest in F
+// (see symbolicFootprints) are expanded in its preheader, and each is passed
+// to a marker,
+//   call void @__cilksan_fp(i1 %guard, ptr %base, i64 %len,
+//                           [i64 %step, i64 %count]...), !cilksan.fp !N
+// where !N is a node distinct to the marker, and the accesses it covers get
+// the same tag. The marker only touches memory nothing else can see, so it
+// stays where it is, and the tag stays on the accesses, or is dropped (the
+// vectorizer keeps a tag every access it merges has; see
+// getMetadataToPropagate). Cilksan takes the markers out before instrumenting
+// (see takeFootprintMarkers). An access is tagged only if its loop has one
+// version and the footprint covers it fully, so the marker stands for it on
+// every path; the others are checked as before. Returns the number of markers.
+unsigned CilkSanitizerImpl::placeFootprintMarkers(Function &F, LoopInfo &LI,
+                                                  ScalarEvolution &SE,
+                                                  DominatorTree &DT,
+                                                  TaskInfo &TI) {
+  Module &M = *F.getParent();
+  LLVMContext &C = F.getContext();
+  Type *I64 = Type::getInt64Ty(C);
+  unsigned Placed = 0;
+  // Outermost first: the subloops of a nest with markers are not tried on
+  // their own.
+  SmallVector<Loop *, 8> Work(LI.begin(), LI.end());
+  while (!Work.empty()) {
+    Loop *O = Work.pop_back_val();
+    SmallVector<SymFootprint, 8> Prints;
+    DenseMap<Instruction *, unsigned> NumVersions;
+    if (!symbolicFootprints(
+            O, LI, SE, DT, TI,
+            [&SE](Instruction &I) { return plainAccessSize(I, SE); }, Prints,
+            NumVersions)) {
+      Work.append(O->begin(), O->end());
+      continue;
+    }
+    DenseMap<Instruction *, unsigned> NumChecks;
+    for (const SymFootprint &P : Prints)
+      if (!P.Dup)
+        for (Instruction *I : P.Members)
+          ++NumChecks[I];
+    Instruction *Term = O->getLoopPreheader()->getTerminator();
+    SCEVExpander Expander(SE, M.getDataLayout(), "cilksan.fp");
+    struct Marker {
+      SmallVector<Value *, 7> Args;
+      SmallVector<Instruction *, 4> Tagged;
+      DebugLoc DL;
+    };
+    SmallVector<Marker, 4> Markers;
+    for (const SymFootprint &P : Prints) {
+      if (P.Dup || P.Partly)
+        continue;
+      Marker K;
+      for (Instruction *I : P.Members)
+        if (NumVersions.lookup(I) == 1 && NumChecks.lookup(I) == 1)
+          K.Tagged.push_back(I);
+      if (K.Tagged.empty())
+        continue;
+      IRBuilder<> IRB(Term);
+      Value *Guard = IRB.getTrue();
+      for (auto [Cond, Dir] : P.Preds)
+        Guard = IRB.CreateAnd(Guard, Dir ? Cond : IRB.CreateNot(Cond));
+      K.Args = {Guard,
+                Expander.expandCodeFor(P.Base, PointerType::getUnqual(C), Term),
+                Expander.expandCodeFor(P.Len, I64, Term)};
+      for (auto [Step, N] : P.Rows) {
+        K.Args.push_back(Expander.expandCodeFor(Step, I64, Term));
+        K.Args.push_back(Expander.expandCodeFor(N, I64, Term));
+      }
+      K.DL = P.I->getDebugLoc();
+      Markers.push_back(std::move(K));
+    }
+    if (Markers.empty()) {
+      Work.append(O->begin(), O->end());
+      continue;
+    }
+    // The markers go together at the end of the preheader, after the values
+    // they're called with.
+    FunctionCallee Fn = getFootprintMarker(M);
+    for (Marker &K : Markers) {
+      CallInst *Call = CallInst::Create(Fn, K.Args, "", Term->getIterator());
+      Call->setDebugLoc(K.DL);
+      MDNode *Tag = MDNode::getDistinct(C, {});
+      Call->setMetadata(FootprintTagKind, Tag);
+      for (Instruction *I : K.Tagged)
+        I->setMetadata(FootprintTagKind, Tag);
+      LLVM_DEBUG(dbgs() << "Footprint marker for " << K.Tagged.size()
+                        << " accesses before loop nest "
+                        << O->getHeader()->getName() << ": " << *Call << "\n");
+    }
+    Placed += Markers.size();
+  }
+  return Placed;
+}
+
+// Whether marker K and access M, which K dominates, run in one strand: they
+// are in one task, and no path from K to M passes a call (other than a
+// memory-free intrinsic, a call that can't race or another marker), detach,
+// reattach or sync. Nothing between VectorizerStart and Cilksan should break
+// the strand the early pass found; this checks it.
+static bool oneStrandFromMarker(Instruction *K, Instruction *M, TaskInfo &TI,
+                                function_ref<bool(const Instruction &)> CannotRace) {
+  BasicBlock *KB = K->getParent(), *MB = M->getParent();
+  if (TI.getTaskFor(KB) != TI.getTaskFor(MB))
+    return false;
+  auto Ends = [&](const Instruction &I) {
+    if (isa<DetachInst>(I) || isa<ReattachInst>(I) || isa<SyncInst>(I))
+      return true;
+    return isa<CallBase>(I) && !isa<DbgInfoIntrinsic>(I) &&
+           !(isa<IntrinsicInst>(I) && !I.mayReadOrWriteMemory()) &&
+           !CannotRace(I) && !isFootprintMarker(I);
+  };
+  // Whether the instructions in [From, To) let the strand go on.
+  auto Clear = [&](BasicBlock::iterator From, BasicBlock::iterator To) {
+    for (; From != To; ++From)
+      if (Ends(*From))
+        return false;
+    return true;
+  };
+  if (KB == MB && K->comesBefore(M))
+    return Clear(std::next(K->getIterator()), M->getIterator());
+  if (!Clear(MB->begin(), M->getIterator()))
+    return false;
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  SmallVector<BasicBlock *, 16> Work(pred_begin(MB), pred_end(MB));
+  while (!Work.empty()) {
+    BasicBlock *B = Work.pop_back_val();
+    if (!Seen.insert(B).second)
+      continue;
+    if (Seen.size() > 512)
+      return false;
+    if (B == KB) {
+      if (!Clear(std::next(K->getIterator()), B->end()))
+        return false;
+      continue;
+    }
+    // M's own block again, on a later iteration: all of it runs.
+    if (!Clear(B->begin(), B->end()))
+      return false;
+    Work.append(pred_begin(B), pred_end(B));
+  }
+  return true;
+}
+
+// Takes the footprint markers out of F (see placeFootprintMarkers), and pairs
+// each tagged access with the nearest marker with its tag that dominates it,
+// if they run in one strand (see oneStrandFromMarker). An access without one
+// is checked on its own. The markers' values stay until the end, for their
+// checks (see planFootprintChecks), and are deleted if unused then.
+void CilkSanitizerImpl::takeFootprintMarkers(Function &F, DominatorTree &DT,
+                                             TaskInfo &TI) {
+  SmallVector<CallInst *, 8> Calls;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (isFootprintMarker(I))
+        Calls.push_back(cast<CallInst>(&I));
+  if (Calls.empty())
+    return;
+  SmallVector<FootprintMarker, 4> Markers;
+  DenseMap<MDNode *, SmallVector<unsigned, 2>> ByTag;
+  for (CallInst *Call : Calls) {
+    Instruction *At = Call->getNextNode();
+    while (isFootprintMarker(*At))
+      At = At->getNextNode();
+    FootprintMarker K{At, Call->getArgOperand(0), Call->getArgOperand(1),
+                      Call->getArgOperand(2), {}, {}};
+    for (unsigned a = 3; a + 1 < Call->arg_size(); a += 2)
+      K.Rows.push_back({Call->getArgOperand(a), Call->getArgOperand(a + 1)});
+    for (Value *V : Call->args())
+      FootprintOperands.push_back(V);
+    if (MDNode *Tag = Call->getMetadata(FootprintTagKind))
+      ByTag[Tag].push_back(Markers.size());
+    Markers.push_back(std::move(K));
+  }
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
+        continue;
+      MDNode *Tag = I.getMetadata(FootprintTagKind);
+      auto It = Tag ? ByTag.find(Tag) : ByTag.end();
+      if (It == ByTag.end())
+        continue;
+      // The markers that dominate I dominate each other; take the last.
+      int Best = -1;
+      for (unsigned k : It->second)
+        if (DT.dominates(Calls[k], &I) &&
+            (Best < 0 || DT.dominates(Calls[Best], Calls[k])))
+          Best = k;
+      if (Best >= 0 &&
+          oneStrandFromMarker(Calls[Best], &I, TI, simpleCallCannotRace)) {
+        Markers[Best].Members.push_back(&I);
+        ++NumFootprintTagsPaired;
+      } else {
+        LLVM_DEBUG(dbgs() << "Footprint marker lost for " << I << "\n");
+        ++NumFootprintTagsLost;
+      }
+    }
+  for (CallInst *Call : Calls)
+    Call->eraseFromParent();
+  auto &Kept = FootprintMarkers[&F];
+  for (FootprintMarker &K : Markers)
+    if (!K.Members.empty())
+      Kept.push_back(std::move(K));
+}
+
+// Range checks for the footprint markers taken out of F, on the accesses N
+// (see HoistNests) didn't cover. A marker's check is a write if an access it
+// covers is a store (its footprint is the marker's, see symbolicFootprints,
+// so the check finds what the store's checks would), and stands for the
+// accesses that would be checked through the delayed path (see
+// hoistableAccessSize). A marker without any is dropped.
+void CilkSanitizerImpl::planFootprintChecks(
+    Function &F, ScalarEvolution &SE, RaceInfo &RI,
+    SmallPtrSetImpl<Instruction *> &Covered) {
+  auto It = FootprintMarkers.find(&F);
+  if (It == FootprintMarkers.end())
+    return;
+  for (FootprintMarker &K : It->second) {
+    Value *GuardV = K.Guard;
+    auto *Guard = dyn_cast_or_null<ConstantInt>(GuardV);
+    if (!GuardV || !K.Base || !K.Len || (Guard && Guard->isZero()))
+      continue;
+    SmallVector<Instruction *, 8> Need;
+    Instruction *Store = nullptr;
+    for (Instruction *I : K.Members) {
+      if (Covered.count(I))
+        continue;
+      if (!Store && isa<StoreInst>(I))
+        Store = I;
+      if (hoistableAccessSize(*I, RI, SE))
+        Need.push_back(I);
+    }
+    if (Need.empty())
+      continue;
+    Instruction *Rep = nullptr;
+    for (Instruction *I : Need)
+      if (isa<StoreInst>(I)) {
+        Rep = I;
+        break;
+      }
+    if (!Rep)
+      Rep = Store ? Store : Need[0];
+    NestCheck NC{Rep, nullptr, nullptr, 0, K.At};
+    NC.AddrV = K.Base;
+    NC.LenV = K.Len;
+    for (auto &[Step, N] : K.Rows) {
+      if (!Step || !N)
+        break;
+      NC.RowsV.push_back({Step, N});
+    }
+    if (NC.RowsV.size() != K.Rows.size())
+      continue;
+    if (!Guard)
+      NC.Preds.push_back({GuardV, true});
+    NC.Members.append(Need.begin(), Need.end());
+    Covered.insert(Need.begin(), Need.end());
+    NestChecks.push_back(std::move(NC));
+    ++NumFootprintMarkersUsed;
+    ++NumSymNestChecks;
+    NumSymNestAccesses += Need.size();
+    LLVM_DEBUG(dbgs() << "Footprint check for " << Need.size()
+                      << " accesses before " << *K.At << "\n");
+  }
+}
+
+// Removes what footprint markers leave behind: their values, if no check
+// uses them, the tags and the attribute, in every function, and the marker's
+// declaration.
+void CilkSanitizerImpl::removeFootprintMarkers() {
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(FootprintOperands);
+  FootprintOperands.clear();
+  FootprintMarkers.clear();
+  for (Function &F : M)
+    F.removeFnAttr(FootprintsAttr);
+  // Tags exist only if a marker was placed, which declared it.
+  Function *Fn = M.getFunction(FootprintMarkerName);
+  if (!Fn)
+    return;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        I.setMetadata(FootprintTagKind, nullptr);
+  if (Fn->use_empty())
+    Fn->eraseFromParent();
+}
+
+// Straight-line accesses checked as a whole (see CoalesceBlocks). Between
+// two calls in a basic block, the accesses run in one strand, in order, all or
+// none, so as for a loop nest, the exact bytes each base is read and written
+// at can be checked in any order: one check per run of written bytes, and of
+// bytes read but not written. The checks go right after the last access they
+// cover, where every address is computed. Calls (other than memory-free
+// intrinsics), atomics and fences end a stretch, so no other instrumented
+// event moves across a check, and so does any join or branch.
+void CilkSanitizerImpl::planBlockChecks(
+    Function &F, ScalarEvolution &SE, RaceInfo &RI,
+    SmallVectorImpl<Instruction *> &LoadsAndStores) {
+  // Accesses checked through the delayed path, with their sizes.
+  SmallDenseMap<Instruction *, int64_t, 32> Cands;
+  for (Instruction *I : LoadsAndStores)
+    if (std::optional<int64_t> Size = hoistableAccessSize(*I, RI, SE))
+      Cands[I] = *Size;
+  LLVM_DEBUG(dbgs() << "Straight-line candidates in " << F.getName() << ": "
+                    << Cands.size() << " of " << LoadsAndStores.size() << "\n");
+  if (Cands.size() < 2)
+    return;
+
+  struct Class {
+    Value *BasePtr;     // the first access's pointer
+    const SCEV *BaseEv; // and its SCEV
+    SmallVector<FootprintAccess, 8> Accesses; // in program order
+  };
+  SmallPtrSet<Instruction *, 32> Covered;
+  SmallVector<Class, 4> Classes;
+  auto Flush = [&]() {
+    for (Class &K : Classes) {
+      if (K.Accesses.size() < 2)
+        continue;
+      // The checks go after the last access, reporting the first of each
+      // kind, and are only worth it with fewer checks than accesses. The base
+      // is an opaque value: expanding its SCEV inside a loop could add an
+      // induction variable.
+      Instruction *Last = K.Accesses.back().I;
+      unsigned Checks = coverClass(
+          K.Accesses, SE, SE.getUnknown(K.BasePtr), /*O=*/nullptr,
+          Last->getNextNode(), /*FirstRep=*/true, /*MaxSpan=*/4096,
+          /*MaxMarks=*/UINT64_MAX, /*MaxRuns=*/K.Accesses.size() - 1);
+      if (!Checks)
+        continue;
+      for (FootprintAccess &A : K.Accesses)
+        Covered.insert(A.I);
+      NumBlockChecks += Checks;
+      NumBlockAccesses += K.Accesses.size();
+      LLVM_DEBUG(dbgs() << "Checking " << K.Accesses.size()
+                        << " straight-line accesses with " << Checks
+                        << " range checks after " << *Last << "\n");
+    }
+    Classes.clear();
+  };
+
+  // A stretch runs on through a chain of blocks, each the only successor of
+  // the one before and with it as only predecessor: instrumentation setup
+  // splits blocks at calls, even to intrinsics such as fmuladd.
+  BasicBlock *Prev = nullptr;
+  for (BasicBlock &BB : F) {
+    if (!(Prev && BB.getSinglePredecessor() == Prev &&
+          Prev->getSingleSuccessor() == &BB))
+      Flush();
+    Prev = &BB;
+    for (Instruction &I : BB) {
+      bool EndsStretch =
+          isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) ||
+          isa<FenceInst>(I) ||
+          (isa<CallBase>(I) && !isa<DbgInfoIntrinsic>(I) &&
+           !(isa<IntrinsicInst>(I) && !I.mayReadOrWriteMemory()));
+      if (auto *Ld = dyn_cast<LoadInst>(&I))
+        EndsStretch |= Ld->isVolatile() || !Ld->isUnordered();
+      if (auto *St = dyn_cast<StoreInst>(&I))
+        EndsStretch |= St->isVolatile() || !St->isUnordered();
+      if (EndsStretch) {
+        Flush();
+        continue;
+      }
+      auto CIt = Cands.find(&I);
+      if (CIt == Cands.end())
+        continue;
+      Value *Ptr = getLoadStorePointerOperand(&I);
+      const SCEV *V = SE.getSCEV(Ptr);
+      int64_t Size = CIt->second;
+      Class *C = nullptr;
+      int64_t Off = 0;
+      for (Class &K : Classes)
+        if (std::optional<int64_t> D = constOffset(SE, V, K.BaseEv)) {
+          Off = *D;
+          C = &K;
+          break;
+        }
+      if (!C) {
+        Classes.push_back({Ptr, V, {}});
+        C = &Classes.back();
+      }
+      C->Accesses.push_back({&I, Off, Size});
+    }
+  }
+  Flush();
+
+  llvm::erase_if(LoadsAndStores,
+                 [&](Instruction *I) { return Covered.count(I); });
 }
 
 bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
@@ -3401,11 +5087,21 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
   // Reset the per-function label-hoisting state before any instrumentation.
   CurTaskInfo = &TI;
   CurDomTree = &DT;
+  CurLoopInfo = &LI;
   SpindleLabelCache.clear();
+  NestChecks.clear();
 
   ICFLoopSafetyInfo SafetyInfo;
 
   ScalarEvolution &SE = *(RI.getSE());
+
+  // Accesses whose checks are hoisted before their loop nest.
+  SmallPtrSet<Instruction *, 32> NestCovered;
+  if (EnableStaticRaceDetection && LoopHoisting && HoistNests)
+    planNestChecks(LI, SE, DT, TI, RI, NestCovered);
+  if (EnableStaticRaceDetection && LoopHoisting && HoistNests &&
+      HoistSymbolicNests)
+    planFootprintChecks(F, SE, RI, NestCovered);
 
   for (BasicBlock &BB : F) {
     // Record the Tapir sync instructions found
@@ -3419,10 +5115,10 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
 
     // Record the memory accesses in the basic block
     for (Instruction &Inst : BB) {
-      bool CanCoalesce = false;
+      bool CanCoalesce = NestCovered.count(&Inst);
       // If the instruction is in a loop and can only race via ancestor, and
       // size < stride, store it.
-      if (L && EnableStaticRaceDetection && LoopHoisting &&
+      if (!CanCoalesce && L && EnableStaticRaceDetection && LoopHoisting &&
           SafetyInfo.isGuaranteedToExecute(Inst, &DT, &TI, L)) {
         // TODO: For now, only look at loads and stores.  Add atomics later.
         //       Need to add any others?
@@ -3459,7 +5155,7 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
           // If this instruction can only race via an ancestor, see if it can be
           // hoisted.
           if (RaceViaAncestor && !OtherRace) {
-            const SCEV *Size = SE.getElementSize(&Inst);
+            const SCEV *Size = accessSize(SE, &Inst);
             const SCEV *V = SE.getSCEV(getLoadStorePointerOperand(&Inst));
             // If not an AddRecExpr, don't proceed
             if (const SCEVAddRecExpr *SrcAR = dyn_cast<SCEVAddRecExpr>(V)) {
@@ -3576,6 +5272,9 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
     chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores, TI,
                                    LI, TLI);
   }
+
+  if (EnableStaticRaceDetection && CoalesceBlocks)
+    planBlockChecks(F, SE, RI, AllLoadsAndStores);
 
   // Evaluate the tasks that might be in parallel with each spindle.
   MaybeParallelTasks MPTasks;
@@ -5074,4 +6773,35 @@ PreservedAnalyses CilkSanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
     return PreservedAnalyses::all();
 
   return PreservedAnalyses::none();
+}
+
+
+// Finds the footprints of F's symbolic nests before the vectorizer changes
+// them, and leaves markers for Cilksan (see placeFootprintMarkers). It runs
+// at VectorizerStart, after the simplification pipeline (LICM, GVN, full
+// unrolling) and before the second LoopRotate, the loop and SLP vectorizers
+// and runtime unrolling, so a nest N would cover with constant trips is often
+// gone or flat by then. Where VectorizerStart doesn't come before Cilksan (at
+// O0, where optnone skips this pass, and in pipelines without it), Cilksan
+// places the markers itself, on the IR it sees (see CilkSanitizerImpl::run).
+// The attribute marks a function this pass has seen.
+PreservedAnalyses CilksanFootprintsPass::run(Function &F,
+                                             FunctionAnalysisManager &AM) {
+  if (!(EnableStaticRaceDetection && LoopHoisting && HoistNests &&
+        HoistSymbolicNests) ||
+      F.empty() || !checkSanitizeCilkAttr(F) ||
+      F.hasFnAttribute(FootprintsAttr))
+    return PreservedAnalyses::all();
+  F.addFnAttr(FootprintsAttr);
+  NumFootprintMarkers += CilkSanitizerImpl::placeFootprintMarkers(
+      F, AM.getResult<LoopAnalysis>(F), AM.getResult<ScalarEvolutionAnalysis>(F),
+      AM.getResult<DominatorTreeAnalysis>(F), AM.getResult<TaskAnalysis>(F));
+  // New instructions in preheaders only.
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  PA.preserve<LoopAnalysis>();
+  PA.preserve<DominatorTreeAnalysis>();
+  PA.preserve<ScalarEvolutionAnalysis>();
+  PA.preserve<TaskAnalysis>();
+  return PA;
 }

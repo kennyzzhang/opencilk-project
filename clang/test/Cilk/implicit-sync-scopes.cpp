@@ -987,7 +987,6 @@ int mix_parfor_trycatch(int a) {
 // CHECK: [[CONTINUE1]]:
 // CHECK: %[[TFTRY:.+]] = {{.*}}call token @llvm.taskframe.create()
 // CHECK: %[[TRYSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK: %[[TASKFRAME2:.+]] = {{.*}}call token @llvm.taskframe.create()
 // CHECK: detach within %[[TRYSYNCREG]], label %[[DETACHED2:.+]], label %[[CONTINUE2:.+]] unwind label %[[DETUNWIND2:.+]]
 
@@ -999,76 +998,42 @@ int mix_parfor_trycatch(int a) {
 // CHECK: [[INVOKECONT]]:
 // CHECK-NEXT: reattach within %[[TRYSYNCREG]], label %[[CONTINUE2]]
 
+// The loop runs in its own taskframe, which holds the loop's sync region.
 // CHECK: [[CONTINUE2]]:
-// CHECK-O0: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[CATCHLPAD:.+]]
+// CHECK-NEXT: %[[PFORTF:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
+// CHECK-O0: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[PFORUNW:.+]]
 
-// CHECK-O1: [[LPAD]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[TRYSYNCREG]],
-// CHECK-O1-NEXT: to label %[[UNREACHABLE:.+]] unwind label %[[DETUNWIND2]]
+// CHECK-O0: [[PFORBODY]]:
+// CHECK-O0: invoke void @_Z3fooi(i32 noundef 3)
+// CHECK-O0-NEXT: to label %[[INVOKECONT2:.+]] unwind label %[[PFORLPAD:.+]]
 
-// CHECK-O1: [[DETUNWIND2]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[TASKFRAME2]],
-// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD:.+]]
+// CHECK-O0: [[INVOKECONT2]]:
+// CHECK-O0: reattach within %[[PFORSYNCREG]], label %[[PFORINC]]
 
-// CHECK-O1: [[CATCHLPAD]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1-NEXT: catch ptr @_ZTIi
-// CHECK-O1: br label %[[CATCHDISPATCH:.+]]
-
-// CHECK-O1: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[PFORUNW:.+]]
-
-// CHECK: [[PFORBODY]]:
-// CHECK: invoke void @_Z3fooi(i32 noundef 3)
-// CHECK-NEXT: to label %[[INVOKECONT2:.+]] unwind label %[[PFORLPAD:.+]]
-
-// CHECK: [[INVOKECONT2]]:
-// CHECK: reattach within %[[PFORSYNCREG]], label %[[PFORINC]]
-
-// CHECK: [[PFORINC]]:
+// CHECK-O0: [[PFORINC]]:
 // CHECK-O0: br i1 {{.+}}, label %{{.+}}, label %[[PFORSYNC:.+]], !llvm.loop
-// CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC:.+]], label %{{.+}}, !llvm.loop
 
-// CHECK: [[PFORSYNC]]:
-// CHECK: sync within %[[PFORSYNCREG]], label %[[PFORSYNCCONT:.+]]
+// CHECK-O0: [[PFORSYNC]]:
+// CHECK-O0: sync within %[[PFORSYNCREG]], label %[[PFORSYNCCONT:.+]]
 
-// CHECK-O0: [[LPAD]]:
-// CHECK-O0-NEXT: landingpad
-// CHECK-O0-NEXT: cleanup
-// CHECK-O0: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[TRYSYNCREG]],
-// CHECK-O0-NEXT: to label %[[UNREACHABLE:.+]] unwind label %[[DETUNWIND2]]
+// CHECK: [[LPAD]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[TRYSYNCREG]],
+// CHECK-NEXT: to label %[[UNREACHABLE:.+]] unwind label %[[DETUNWIND2]]
 
-// CHECK-O0: [[DETUNWIND2]]:
-// CHECK-O0-NEXT: landingpad
-// CHECK-O0-NEXT: cleanup
-// CHECK-O0: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[TASKFRAME2]],
-// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD]]
+// CHECK: [[DETUNWIND2]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[TASKFRAME2]],
+// CHECK-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD:.+]]
 
-// CHECK-O0: [[CATCHLPAD]]:
-// CHECK-O0-NEXT: landingpad
-// CHECK-O0-NEXT: cleanup
-// CHECK-O0-NEXT: catch ptr @_ZTIi
-// CHECK-O0: br label %[[CATCHDISPATCH:.+]]
-
-// CHECK-O1: [[PFORLPAD]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG]],
-// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORUNW:.+]]
-
-// CHECK-O1: [[PFORUNW]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1-NEXT: catch ptr @_ZTIi
-// CHECK-O1-NEXT: br label %[[CATCHDISPATCH]]
-
-// CHECK-O1: [[PFORSYNCCONT]]:
-// CHECK-O1-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG]])
-// CHECK-O1-NEXT: to label %[[PFORSUCONT:.+]] unwind label %[[PFORUNW]]
+// CHECK: [[CATCHLPAD]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK-NEXT: catch ptr @_ZTIi
+// CHECK: br label %[[CATCHDISPATCH:.+]]
 
 // CHECK: [[CATCHDISPATCH]]:
 // CHECK: br i1 {{.+}}, label %[[CATCH:.+]], label %[[RESUME:.+]]
@@ -1095,19 +1060,41 @@ int mix_parfor_trycatch(int a) {
 // CHECK-NEXT: call void @llvm.sync.unwind(token %[[SYNCREG]])
 // CHECK: ret i32 0
 
-// CHECK-O0: [[PFORLPAD]]:
-// CHECK-O0-NEXT: landingpad
-// CHECK-O0-NEXT: cleanup
-// CHECK-O0: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG]],
-// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD]]
+// CHECK-O1: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[PFORUNW:.+]]
 
-// CHECK-O0: [[PFORSYNCCONT]]:
-// CHECK-O0-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG]])
-// CHECK-O0-NEXT: to label %[[PFORSUCONT:.+]] unwind label %[[CATCHLPAD]]
+// CHECK-O1: [[PFORBODY]]:
+// CHECK-O1: invoke void @_Z3fooi(i32 noundef 3)
+// CHECK-O1-NEXT: to label %[[INVOKECONT2:.+]] unwind label %[[PFORLPAD:.+]]
+
+// CHECK-O1: [[INVOKECONT2]]:
+// CHECK-O1: reattach within %[[PFORSYNCREG]], label %[[PFORINC]]
+
+// CHECK-O1: [[PFORINC]]:
+// CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC:.+]], label %{{.+}}, !llvm.loop
+
+// CHECK-O1: [[PFORSYNC]]:
+// CHECK-O1: sync within %[[PFORSYNCREG]], label %[[PFORSYNCCONT:.+]]
+
+// CHECK: [[PFORLPAD]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG]],
+// CHECK-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORUNW]]
+
+// CHECK: [[PFORUNW]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF]],
+// CHECK-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD]]
+
+// CHECK: [[PFORSYNCCONT]]:
+// CHECK-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG]])
+// CHECK-NEXT: to label %[[PFORSUCONT:.+]] unwind label %[[PFORUNW]]
 
 // CHECK: [[PFORSUCONT]]:
 // CHECK-O0-NEXT: br label %[[PFOREND:.+]]
 // CHECK-O0: [[PFOREND]]:
+// CHECK-NEXT: call void @llvm.taskframe.end(token %[[PFORTF]])
 // CHECK-NEXT: call void @_Z9nothrowfni(i32 noundef 4)
 // CHECK-NEXT: sync within %[[TRYSYNCREG]], label %[[TRYSYNCCONT:.+]]
 
@@ -1164,7 +1151,6 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK: [[CONTINUE1]]:
 // CHECK: %[[TFTRY:.+]] = {{.*}}call token @llvm.taskframe.create()
 // CHECK: %[[TRYSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK-O1: call void @llvm.lifetime.start.p0(i64 [[B2SIZE:.+]], ptr nonnull %[[B2ADDR:.+]])
 // CHECK: invoke void @_ZN3BarC1Ev(ptr {{.*}}%[[B2:.+]])
 // CHECK-NEXT: to label %[[INVOKECONT2:.+]] unwind label %[[B2CONSTRLPAD:.+]]
@@ -1181,8 +1167,11 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK: [[INVOKECONT3]]:
 // CHECK-NEXT: reattach within %[[TRYSYNCREG]], label %[[CONTINUE2]]
 
+// The loop runs in its own taskframe, which holds the loop's sync region.
 // CHECK: [[CONTINUE2]]:
-// CHECK-O0: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[CATCHLPAD:.+]]
+// CHECK-NEXT: %[[PFORTF:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
+// CHECK-O0: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[PFORUNW:.+]]
 
 // CHECK-O1: [[LPAD]]:
 // CHECK-O1-NEXT: landingpad
@@ -1225,6 +1214,10 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK-O1-NEXT: catch ptr @_ZTIi
 // CHECK-O1: br label %[[B2CLEANUP:.+]]
 
+// CHECK-O1: [[B2CLEANUP]]:
+// CHECK-O1: call void @_ZN3BarD1Ev(ptr {{.*}}%[[B2]])
+// CHECK-O1-NEXT: br label %[[CATCHDISPATCH]]
+
 // CHECK-O1: detach within %[[PFORSYNCREG]], label %[[PFORBODY:.+]], label %[[PFORINC:.+]] unwind label %[[PFORUNW:.+]]
 
 // CHECK: [[PFORBODY]]:
@@ -1250,11 +1243,12 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK-O1: [[PFORUNW]]:
 // CHECK-O1-NEXT: landingpad
 // CHECK-O1-NEXT: cleanup
-// CHECK-O1-NEXT: catch ptr @_ZTIi
-// CHECK-O1-NEXT: br label %[[B2CLEANUP]]
+// CHECK-O1: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF]],
+// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD]]
 
 // CHECK-O1: [[PFORSYNCCONT]]:
-// CHECK-O1: call void @_Z9nothrowfni(i32 noundef 4)
+// CHECK-O1: call void @llvm.taskframe.end(token %[[PFORTF]])
+// CHECK-O1-NEXT: call void @_Z9nothrowfni(i32 noundef 4)
 // CHECK-O1-NEXT: sync within %[[TRYSYNCREG]], label %[[TRYSYNCCONT:.+]]
 
 // CHECK-O1: [[TRYSYNCCONT]]:
@@ -1304,10 +1298,6 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK-O0: call void @_ZN3BarD1Ev(ptr {{.*}}%[[B2]])
 // CHECK-O0: br label %[[CATCHDISPATCH:.+]]
 
-// CHECK-O1: [[B2CLEANUP]]:
-// CHECK-O1: call void @_ZN3BarD1Ev(ptr {{.*}}%[[B2]])
-// CHECK-O1-NEXT: br label %[[CATCHDISPATCH]]
-
 // CHECK: [[CATCHDISPATCH]]:
 // CHECK-O1: call void @llvm.lifetime.end.p0(i64 [[B2SIZE]], ptr nonnull %[[B2ADDR]])
 // CHECK: br i1 {{.+}}, label %[[CATCH:.+]], label %[[RESUME:.+]]
@@ -1347,10 +1337,17 @@ int mix_parfor_trycatch_destructors(int a) {
 // CHECK-O0-NEXT: landingpad
 // CHECK-O0-NEXT: cleanup
 // CHECK-O0: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG]],
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORUNW]]
+
+// CHECK-O0: [[PFORUNW]]:
+// CHECK-O0-NEXT: landingpad
+// CHECK-O0-NEXT: cleanup
+// CHECK-O0: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF]],
 // CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[CATCHLPAD]]
 
 // CHECK-O0: [[PFORSYNCCONT]]:
-// CHECK-O0: call void @_Z9nothrowfni(i32 noundef 4)
+// CHECK-O0: call void @llvm.taskframe.end(token %[[PFORTF]])
+// CHECK-O0-NEXT: call void @_Z9nothrowfni(i32 noundef 4)
 // CHECK-O0-NEXT: sync within %[[TRYSYNCREG]], label %[[TRYSYNCCONT:.+]]
 
 // CHECK-O0: [[TRYSYNCCONT]]:
@@ -1974,8 +1971,6 @@ int parfor_trycatch(int a) {
 
 // CHECK-LABEL: define {{.*}}i32 @_Z15parfor_trycatchi(
 // CHECK: %[[SYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG1:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG2:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK: %[[TASKFRAME1:.+]] = {{.*}}call token @llvm.taskframe.create()
 // CHECK: detach within %[[SYNCREG]], label %[[DETACHED1:.+]], label %[[CONTINUE1:.+]]
 
@@ -1984,7 +1979,10 @@ int parfor_trycatch(int a) {
 // CHECK-NEXT: call void @_Z3fooi(i32 noundef 1)
 // CHECK-NEXT: reattach within %[[SYNCREG]], label %[[CONTINUE1]]
 
+// Each loop runs in its own taskframe, which holds the loop's sync region.
 // CHECK: [[CONTINUE1]]:
+// CHECK-NEXT: %[[PFORTF1:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG1:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK: detach within %[[PFORSYNCREG1]], label %[[PFORBODY1:.+]], label %[[PFORINC1:.+]] unwind label %[[PFORDU1:.+]]
 
 // CHECK: [[PFORBODY1]]:
@@ -2053,8 +2051,7 @@ int parfor_trycatch(int a) {
 // CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC1:.+]], label {{.+}} !llvm.loop
 
 // CHECK: [[PFORSYNC1]]:
-// CHECK-O0: sync within %[[PFORSYNCREG1]], label %[[PFORSYNCCONT1:.+]]
-// CHECK-O1: sync within %[[PFORSYNCREG1]], label %[[PFOREND1:.+]]
+// CHECK: sync within %[[PFORSYNCREG1]], label %[[PFORSYNCCONT1:.+]]
 
 // CHECK-O0: [[TASKCLEANUP1]]:
 // CHECK-O0: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG1]],
@@ -2063,13 +2060,17 @@ int parfor_trycatch(int a) {
 // CHECK-O0: [[PFORDU1]]:
 // CHECK-O0-NEXT: landingpad
 // CHECK-O0-NEXT: cleanup
-// CHECK-O0: br label %[[EHRESUME:.+]]
+// CHECK-O0: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF1]],
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORTFLPAD1:.+]]
 
-// CHECK-O0: [[PFORSYNCCONT1]]:
-// CHECK-O0-NEXT: call void @llvm.sync.unwind(token %[[PFORSYNCREG1]])
-// CHECK-O0-NEXT: br label %[[PFOREND1:.+]]
+// CHECK: [[PFORSYNCCONT1]]:
+// CHECK-NEXT: call void @llvm.sync.unwind(token %[[PFORSYNCREG1]])
+// CHECK-NEXT: br label %[[PFOREND1:.+]]
 
 // CHECK: [[PFOREND1]]:
+// CHECK-NEXT: call void @llvm.taskframe.end(token %[[PFORTF1]])
+// CHECK-NEXT: %[[PFORTF2:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG2:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK: detach within %[[PFORSYNCREG2]], label %[[PFORBODY2:.+]], label %[[PFORINC2:.+]] unwind label %[[PFORDU2:.+]]
 
 // CHECK: [[PFORBODY2]]:
@@ -2095,6 +2096,11 @@ int parfor_trycatch(int a) {
 // CHECK-O0: [[TRYSUCONT2]]:
 // CHECK-O0-NEXT: br label %[[TRYCONT2:.+]]
 // CHECK-O1-NEXT: to label %[[TRYCONT2:.+]] unwind label %[[CATCHLPAD2:.+]]
+
+// CHECK-O0: [[PFORTFLPAD1]]:
+// CHECK-O0-NEXT: landingpad
+// CHECK-O0-NEXT: cleanup
+// CHECK-O0: br label %[[EHRESUME:.+]]
 
 // CHECK: [[LPAD2]]:
 // CHECK-NEXT: landingpad
@@ -2138,8 +2144,7 @@ int parfor_trycatch(int a) {
 // CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC2:.+]], label {{.+}}, !llvm.loop
 
 // CHECK: [[PFORSYNC2]]:
-// CHECK-O0: sync within %[[PFORSYNCREG2]], label %[[PFORSYNCCONT2:.+]]
-// CHECK-O1: sync within %[[PFORSYNCREG2]], label %[[PFOREND2:.+]]
+// CHECK: sync within %[[PFORSYNCREG2]], label %[[PFORSYNCCONT2:.+]]
 
 // CHECK-O0: [[TASKCLEANUP2]]:
 // CHECK-O0: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG2]],
@@ -2148,13 +2153,15 @@ int parfor_trycatch(int a) {
 // CHECK-O0: [[PFORDU2]]:
 // CHECK-O0-NEXT: landingpad
 // CHECK-O0-NEXT: cleanup
-// CHECK-O0: br label %[[EHRESUME]]
+// CHECK-O0: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF2]],
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORTFLPAD2:.+]]
 
-// CHECK-O0: [[PFORSYNCCONT2]]:
-// CHECK-O0-NEXT: call void @llvm.sync.unwind(token %[[PFORSYNCREG2]])
-// CHECK-O0-NEXT: br label %[[PFOREND2:.+]]
+// CHECK: [[PFORSYNCCONT2]]:
+// CHECK-NEXT: call void @llvm.sync.unwind(token %[[PFORSYNCREG2]])
+// CHECK-NEXT: br label %[[PFOREND2:.+]]
 
 // CHECK: [[PFOREND2]]:
+// CHECK-NEXT: call void @llvm.taskframe.end(token %[[PFORTF2]])
 // CHECK: %[[TASKFRAME4:.+]] = {{.*}}call token @llvm.taskframe.create()
 // CHECK: detach within %[[SYNCREG]], label %[[DETACHED2:.+]], label %[[CONTINUE2:.+]]
 
@@ -2170,6 +2177,11 @@ int parfor_trycatch(int a) {
 // CHECK: [[SYNCCONT2]]:
 // CHECK-NEXT: call void @llvm.sync.unwind(token %[[SYNCREG]])
 // CHECK: ret i32 0
+
+// CHECK-O0: [[PFORTFLPAD2]]:
+// CHECK-O0-NEXT: landingpad
+// CHECK-O0-NEXT: cleanup
+// CHECK-O0: br label %[[EHRESUME]]
 
 // CHECK-O0: [[EHRESUME]]:
 // CHECK-O0: resume
@@ -2208,8 +2220,6 @@ int parfor_trycatch_destructors(int a) {
 
 // CHECK-LABEL: define {{.*}}i32 @_Z27parfor_trycatch_destructorsi(
 // CHECK: %[[SYNCREG:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG1:.+]] = {{.*}}call token @llvm.syncregion.start()
-// CHECK: %[[PFORSYNCREG2:.+]] = {{.*}}call token @llvm.syncregion.start()
 // CHECK-O1: call void @llvm.lifetime.start.p0(i64 [[B1SIZE:.+]], ptr nonnull %[[B1ADDR:.+]])
 // CHECK: call void @_ZN3BarC1Ev(ptr {{.*}}%[[B1:.+]])
 // CHECK: %[[TASKFRAME1:.+]] = {{.*}}call token @llvm.taskframe.create()
@@ -2223,7 +2233,10 @@ int parfor_trycatch_destructors(int a) {
 // CHECK: [[INVOKECONT1]]:
 // CHECK-NEXT: reattach within %[[SYNCREG]], label %[[CONTINUE1]]
 
+// Each loop runs in its own taskframe, which holds the loop's sync region.
 // CHECK: [[CONTINUE1]]:
+// CHECK-NEXT: %[[PFORTF1:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG1:.+]] = {{.*}}call token @llvm.syncregion.start()
 
 // CHECK-O1: [[LPAD1]]:
 // CHECK-O1-NEXT: landingpad
@@ -2241,6 +2254,16 @@ int parfor_trycatch_destructors(int a) {
 // CHECK-O1-NEXT: landingpad
 // CHECK-O1-NEXT: cleanup
 // CHECK-O1: br label %[[TASKCLEANUP1:.+]]
+
+// CHECK-O1: [[PFORTFLPAD1:.+]]:
+// CHECK-O1-NEXT: landingpad
+// CHECK-O1-NEXT: cleanup
+// CHECK-O1-NEXT: br label %[[TASKCLEANUP1]]
+
+// CHECK-O1: [[PFORTFLPAD2:.+]]:
+// CHECK-O1-NEXT: landingpad
+// CHECK-O1-NEXT: cleanup
+// CHECK-O1-NEXT: br label %[[TASKCLEANUP1]]
 
 // CHECK: detach within %[[PFORSYNCREG1]], label %[[PFORBODY1:.+]], label %[[PFORINC1:.+]] unwind label %[[PFORDU1:.+]]
 
@@ -2284,9 +2307,9 @@ int parfor_trycatch_destructors(int a) {
 // CHECK-O0-NEXT: landingpad
 // CHECK-O0-NEXT: cleanup
 // CHECK-O0: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[TASKFRAME1]],
-// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORDU1]]
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[OUTERCLEANUPLPAD:.+]]
 
-// CHECK-O0: [[PFORDU1]]:
+// CHECK-O0: [[OUTERCLEANUPLPAD]]:
 // CHECK-O0-NEXT: landingpad
 // CHECK-O0-NEXT: cleanup
 // CHECK-O0: br label %[[TASKCLEANUP1:.+]]
@@ -2341,27 +2364,31 @@ int parfor_trycatch_destructors(int a) {
 // CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC1:.+]], label {{.+}}, !llvm.loop
 
 // CHECK: [[PFORSYNC1]]:
-// CHECK-O0: sync within %[[PFORSYNCREG1]], label %[[PFORSYNCCONT1:.+]]
-// CHECK-O1: sync within %[[PFORSYNCREG1]], label %[[PFOREND1:.+]]
+// CHECK: sync within %[[PFORSYNCREG1]], label %[[PFORSYNCCONT1:.+]]
 
 // CHECK: [[PFORCLEANUP1]]:
 // CHECK: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG1]],
 // CHECK-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORDU1]]
 
-// CHECK-O1: [[PFORDU1]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1: br label %[[TASKCLEANUP1]]
+// CHECK: [[PFORDU1]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF1]],
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[OUTERCLEANUPLPAD]]
+// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORTFLPAD1]]
 
-// CHECK-O0: [[PFORSYNCCONT1]]:
-// CHECK-O0-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG1]])
+// CHECK: [[PFORSYNCCONT1]]:
+// CHECK-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG1]])
 // CHECK-O0-NEXT: to label %[[PFORSUCONT1:.+]] unwind label %[[PFORDU1]]
+// CHECK-O1-NEXT: to label %[[PFOREND1:.+]] unwind label %[[PFORDU1]]
 // CHECK-O0: [[PFORSUCONT1]]:
 // CHECK-O0-NEXT: br label %[[PFOREND1:.+]]
 
 // CHECK: [[PFOREND1]]:
-// CHECK-O0: detach within %[[PFORSYNCREG2]], label %[[PFORBODY2:.+]], label %[[PFORINC2:.+]] unwind label %[[PFORDU1]]
-// CHECK-O1: detach within %[[PFORSYNCREG2]], label %[[PFORBODY2:.+]], label %[[PFORINC2:.+]] unwind label %[[PFORDU2:.+]]
+// CHECK-NEXT: call void @llvm.taskframe.end(token %[[PFORTF1]])
+// CHECK-NEXT: %[[PFORTF2:.+]] = {{.*}}call token @llvm.taskframe.create()
+// CHECK-NEXT: %[[PFORSYNCREG2:.+]] = {{.*}}call token @llvm.syncregion.start()
+// CHECK: detach within %[[PFORSYNCREG2]], label %[[PFORBODY2:.+]], label %[[PFORINC2:.+]] unwind label %[[PFORDU2:.+]]
 
 // CHECK: [[PFORBODY2]]:
 // CHECK: %[[TRYSYNCREG2:.+]] = {{.*}}call token @llvm.syncregion.start()
@@ -2443,29 +2470,31 @@ int parfor_trycatch_destructors(int a) {
 // CHECK-O1: br i1 {{.+}}, label %[[PFORSYNC2:.+]], label {{.+}}, !llvm.loop
 
 // CHECK: [[PFORSYNC2]]:
-// CHECK-O0: sync within %[[PFORSYNCREG2]], label %[[PFORSYNCCONT2:.+]]
-// CHECK-O1: sync within %[[PFORSYNCREG2]], label %[[PFOREND2:.+]]
+// CHECK: sync within %[[PFORSYNCREG2]], label %[[PFORSYNCCONT2:.+]]
 
 // CHECK: [[PFORCLEANUP2]]:
 // CHECK: invoke void @llvm.detached.rethrow.sl_p0i32s(token %[[PFORSYNCREG2]],
-// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORDU1]]
-// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORDU2]]
+// CHECK-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORDU2]]
 
-// CHECK-O1: [[PFORDU2]]:
-// CHECK-O1-NEXT: landingpad
-// CHECK-O1-NEXT: cleanup
-// CHECK-O1: br label %[[TASKCLEANUP1]]
+// CHECK: [[PFORDU2]]:
+// CHECK-NEXT: landingpad
+// CHECK-NEXT: cleanup
+// CHECK: invoke void @llvm.taskframe.resume.sl_p0i32s(token %[[PFORTF2]],
+// CHECK-O0-NEXT: to label %[[UNREACHABLE]] unwind label %[[OUTERCLEANUPLPAD]]
+// CHECK-O1-NEXT: to label %[[UNREACHABLE]] unwind label %[[PFORTFLPAD2]]
 
-// CHECK-O0: [[PFORSYNCCONT2]]:
-// CHECK-O0-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG2]])
-// CHECK-O0-NEXT: to label %[[PFORSUCONT2:.+]] unwind label %[[PFORDU1]]
+// CHECK: [[PFORSYNCCONT2]]:
+// CHECK-NEXT: invoke void @llvm.sync.unwind(token %[[PFORSYNCREG2]])
+// CHECK-O0-NEXT: to label %[[PFORSUCONT2:.+]] unwind label %[[PFORDU2]]
+// CHECK-O1-NEXT: to label %[[PFOREND2:.+]] unwind label %[[PFORDU2]]
 // CHECK-O0: [[PFORSUCONT2]]:
 // CHECK-O0-NEXT: br label %[[PFOREND2:.+]]
 
 // CHECK: [[PFOREND2]]:
+// CHECK-NEXT: call void @llvm.taskframe.end(token %[[PFORTF2]])
 // CHECK-O1: call void @llvm.lifetime.start.p0(i64 [[B4SIZE:.+]], ptr nonnull %[[B4ADDR:.+]])
 // CHECK-NEXT: invoke void @_ZN3BarC1Ev(ptr {{.*}}%[[B4:.+]])
-// CHECK-O0-NEXT: to label %[[B4CONSTRCONT:.+]] unwind label %[[PFORDU1]]
+// CHECK-O0-NEXT: to label %[[B4CONSTRCONT:.+]] unwind label %[[OUTERCLEANUPLPAD]]
 // CHECK-O1-NEXT: to label %[[B4CONSTRCONT:.+]] unwind label %[[B4CONSTRLPAD:.+]]
 
 // CHECK: [[B4CONSTRCONT]]:

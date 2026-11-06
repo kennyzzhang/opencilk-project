@@ -185,8 +185,16 @@ static bool removeRedundantSyncRegions(MaybeParallelTasks &MPTasks, Task *T) {
       SR->replaceAllUsesWith(FirstSyncRegion);
       // Ensure that the first sync region is in the entry block of T.
       if (Instruction *SyncRegI = dyn_cast<Instruction>(FirstSyncRegion))
-        if (SyncRegI->getParent() != T->getEntry())
-          SyncRegI->moveAfter(&*T->getEntry()->getFirstInsertionPt());
+        if (SyncRegI->getParent() != T->getEntry()) {
+          // The entry block might contain only its terminator, for example
+          // after taskframes in T are removed.  Never move the sync region
+          // after the terminator.
+          Instruction *InsertPt = &*T->getEntry()->getFirstInsertionPt();
+          if (InsertPt->isTerminator())
+            SyncRegI->moveBefore(InsertPt->getIterator());
+          else
+            SyncRegI->moveAfter(InsertPt);
+        }
     }
   }
 

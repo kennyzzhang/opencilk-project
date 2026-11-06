@@ -105,21 +105,28 @@ void parallelfor_except(int n) {
 
 // CHECK-LABEL: @_Z20parallelfor_tryblocki(
 void parallelfor_tryblock(int n) {
-  // CHECK: %[[SYNCREG1:.+]] = call token @llvm.syncregion.start()
-  // CHECK: %[[SYNCREG2:.+]] = call token @llvm.syncregion.start()
   try
     {
+      // Each loop runs in its own taskframe, which holds the loop's sync region.
+      // CHECK: %[[LOOPTF1:.+]] = call token @llvm.taskframe.create()
+      // CHECK-NEXT: %[[SYNCREG1:.+]] = call token @llvm.syncregion.start()
       // CHECK-NOT: detach within %[[SYNCREG1]], label %{{.+}}, label %{{.+}} unwind
       cilk_for (int i = 0; i < n; ++i)
         quuz(i);
+      // CHECK: sync within %[[SYNCREG1]]
       // CHECK: invoke void @llvm.sync.unwind(token %[[SYNCREG1]])
-      // CHECK-NEXT: to label %{{.+}} unwind label %[[CATCH:.+]]
-      // CHECK: [[CATCH]]:
-      // CHECK: landingpad [[LPADTYPE]]
-      // CHECK-NEXT: catch ptr @_ZTIi
-      // CHECK-NEXT: catch ptr null
+      // CHECK-NEXT: to label %{{.+}} unwind label %[[TFLPAD1:.+]]
+      // CHECK: [[TFLPAD1]]:
+      // CHECK-NEXT: landingpad [[LPADTYPE]]
+      // CHECK-NEXT: cleanup
+      // CHECK: invoke void @llvm.taskframe.resume
+      // CHECK: (token %[[LOOPTF1]], [[LPADTYPE]] {{.+}})
+      // CHECK-NEXT: to label {{.+}} unwind label %[[CATCH:.+]]
+      // CHECK: call void @llvm.taskframe.end(token %[[LOOPTF1]])
 
-      // CHECK: detach within %[[SYNCREG2]], label %[[DETACHED:.+]], label %{{.+}} unwind label %[[CATCH]]
+      // CHECK: %[[LOOPTF2:.+]] = call token @llvm.taskframe.create()
+      // CHECK-NEXT: %[[SYNCREG2:.+]] = call token @llvm.syncregion.start()
+      // CHECK: detach within %[[SYNCREG2]], label %[[DETACHED:.+]], label %{{.+}} unwind label %[[TFLPAD2:.+]]
       // CHECK: [[DETACHED]]:
       // CHECK: %[[OBJ:.+]] = invoke {{.*}}ptr @_Znwm(i64 noundef 1)
       // CHECK-NEXT: to label %[[INVOKECONT1:.+]] unwind label %[[TASKLPAD:.+]]
@@ -132,6 +139,10 @@ void parallelfor_tryblock(int n) {
       // CHECK: [[INVOKECONT3]]
       // CHECK: reattach within %[[SYNCREG2]]
       // CHECK-DAG: sync within %[[SYNCREG2]]
+      // CHECK: [[CATCH]]:
+      // CHECK: landingpad [[LPADTYPE]]
+      // CHECK-NEXT: catch ptr @_ZTIi
+      // CHECK-NEXT: catch ptr null
       // CHECK: [[TASKLPAD]]:
       // CHECK-NEXT: landingpad [[LPADTYPE:.+]]
       // CHECK-NEXT: cleanup
@@ -144,7 +155,16 @@ void parallelfor_tryblock(int n) {
       // CHECK: [[TASKRESUME]]:
       // CHECK: invoke void @llvm.detached.rethrow
       // CHECK: (token %[[SYNCREG2]], [[LPADTYPE]] {{.+}})
+      // CHECK-NEXT: to label {{.+}} unwind label %[[TFLPAD2]]
+      // CHECK: [[TFLPAD2]]:
+      // CHECK-NEXT: landingpad [[LPADTYPE]]
+      // CHECK-NEXT: cleanup
+      // CHECK: invoke void @llvm.taskframe.resume
+      // CHECK: (token %[[LOOPTF2]], [[LPADTYPE]] {{.+}})
       // CHECK-NEXT: to label {{.+}} unwind label %[[CATCH]]
+      // CHECK: invoke void @llvm.sync.unwind(token %[[SYNCREG2]])
+      // CHECK-NEXT: to label %{{.+}} unwind label %[[TFLPAD2]]
+      // CHECK: call void @llvm.taskframe.end(token %[[LOOPTF2]])
       cilk_for (int i = 0; i < n; ++i)
         bar(new Foo());
     }
@@ -160,9 +180,11 @@ void parallelfor_tryblock(int n) {
 
 // CHECK-LABEL: @_Z27parallelfor_tryblock_inlinei(
 void parallelfor_tryblock_inline(int n) {
-  // CHECK: %[[SYNCREG:.+]] = call token @llvm.syncregion.start()
   try
     {
+      // The loop runs in its own taskframe, which holds the loop's sync region.
+      // CHECK: %[[LOOPTF:.+]] = call token @llvm.taskframe.create()
+      // CHECK-NEXT: %[[SYNCREG:.+]] = call token @llvm.syncregion.start()
       // CHECK: detach within %[[SYNCREG]], label %[[DETACHED:.+]], label %{{.+}} unwind label %[[DUNWIND:.+]]
       // CHECK: [[DETACHED]]:
       // CHECK: invoke {{.*}}ptr @_Znwm(
@@ -179,6 +201,15 @@ void parallelfor_tryblock_inline(int n) {
       // CHECK: (token %[[SYNCREG]], [[LPADTYPE]] {{.+}})
       // CHECK-NEXT: to label {{.+}} unwind label %[[DUNWIND]]
       // CHECK: [[DUNWIND]]:
+      // CHECK-NEXT: landingpad [[LPADTYPE]]
+      // CHECK-NEXT: cleanup
+      // CHECK: invoke void @llvm.taskframe.resume
+      // CHECK: (token %[[LOOPTF]], [[LPADTYPE]] {{.+}})
+      // CHECK-NEXT: to label {{.+}} unwind label %[[CATCH:.+]]
+      // CHECK: invoke void @llvm.sync.unwind(token %[[SYNCREG]])
+      // CHECK-NEXT: to label %{{.+}} unwind label %[[DUNWIND]]
+      // CHECK: call void @llvm.taskframe.end(token %[[LOOPTF]])
+      // CHECK: [[CATCH]]:
       // CHECK: landingpad [[LPADTYPE]]
       // CHECK-NEXT: catch ptr @_ZTIi
       // CHECK-NEXT: catch ptr null

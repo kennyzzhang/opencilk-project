@@ -529,6 +529,14 @@ void CodeGenFunction::EmitCilkScopeStmt(const CilkScopeStmt &S) {
 
 void CodeGenFunction::EmitCilkForRangeStmt(const CilkForRangeStmt &S,
                                            ArrayRef<const Attr *> ForAttrs) {
+  // Put the loop in its own taskframe, as cilk_scope does, in case spawns
+  // outside the loop are still pending.  The loop's sync then belongs to the
+  // taskframe, which Tapir outlines into its own function and Cilk frame, so
+  // a runtime that restores state per frame at a sync can't confuse the two.
+  // The taskframe opens before LoopExit, so the branch to pfor.end stays
+  // inside it and the taskframe ends after the loop's sync.  A no-op when no
+  // sync region encloses the loop.
+  TaskFrameScope TFScope(*this);
 
   JumpDest LoopExit = getJumpDestInCurrentScope("pfor.end");
 
@@ -919,6 +927,9 @@ template <typename LoopStmt> static bool hasEmptyLoopBody(const LoopStmt &S) {
 
 void CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S,
                                       ArrayRef<const Attr *> ForAttrs) {
+  // See EmitCilkForRangeStmt.
+  TaskFrameScope TFScope(*this);
+
   JumpDest LoopExit = getJumpDestInCurrentScope("pfor.end");
 
   PushSyncRegion();

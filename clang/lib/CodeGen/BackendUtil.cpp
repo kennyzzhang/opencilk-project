@@ -1169,7 +1169,14 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     // Register the Cilksan pass.
     if (LangOpts.Sanitize.has(SanitizerKind::Cilk) ||
         LangOpts.Sanitize.has(SanitizerKind::Cilkprace) ||
-        LangOpts.Sanitize.has(SanitizerKind::CilkPiston))
+        LangOpts.Sanitize.has(SanitizerKind::CilkPiston)) {
+      // Cilksan's symbolic nests are found before the vectorizer changes
+      // them. VectorizerStart comes before TapirLate wherever both run;
+      // elsewhere CilkSanitizerPass finds them itself.
+      PB.registerVectorizerStartEPCallback(
+          [](FunctionPassManager &FPM, OptimizationLevel Level) {
+            FPM.addPass(CilksanFootprintsPass());
+          });
       PB.registerTapirLateEPCallback(
           [&PB, Cilkprace = LangOpts.Sanitize.has(SanitizerKind::Cilkprace)](
               ModulePassManager &MPM, OptimizationLevel Level) {
@@ -1183,6 +1190,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
             MPM.addPass(CilkSanitizerPass());
             MPM.addPass(PB.buildPostCilkInstrumentationPipeline(Level));
           });
+    }
     // Register CSI instrumentation for Cilkscale
     if (LangOpts.getCilktool() != LangOptions::CilktoolKind::Cilktool_None) {
       switch (LangOpts.getCilktool()) {

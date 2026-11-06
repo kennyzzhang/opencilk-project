@@ -28,6 +28,13 @@ public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
+/// Finds the footprints of symbolic loop nests before the vectorizer, for
+/// CilkSanitizerPass (see -cilksan-hoist-symbolic-nests).
+class CilksanFootprintsPass : public PassInfoMixin<CilksanFootprintsPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 } // end namespace llvm
 
 #endif // LLVM_TRANSFORMS_CILKSANITIZER_H

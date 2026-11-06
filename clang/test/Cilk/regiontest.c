@@ -39,11 +39,14 @@ void syncreg_loop(int n) {
 // CHECK-LABEL: mixed_spawn_and_loop(
 int mixed_spawn_and_loop(int n) {
   // CHECK: %[[SYNCREGTOP:.+]] = call token @llvm.syncregion.start()
-  // CHECK: %[[SYNCREGLOOP:.+]] = call token @llvm.syncregion.start()
   // CHECK: detach within %[[SYNCREGTOP]]
   int x = _Cilk_spawn bar();
+  // The loop runs in its own taskframe, which holds the loop's sync region.
+  // CHECK: %[[LOOPTF:.+]] = call token @llvm.taskframe.create()
+  // CHECK-NEXT: %[[SYNCREGLOOP:.+]] = call token @llvm.syncregion.start()
   // CHECK-DAG: detach within %[[SYNCREGLOOP]]
   // CHECK-DAG: sync within %[[SYNCREGLOOP]]
+  // CHECK: call void @llvm.taskframe.end(token %[[LOOPTF]])
   _Cilk_for(int i = 0; i < n; ++i) {
     baz(i);
   }

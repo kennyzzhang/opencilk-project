@@ -1619,7 +1619,9 @@ protected:
   FunctionCallee RTUnitInit = nullptr;
 
   Type *IntptrTy;
-  DenseMap<StringRef, uint64_t> FuncOffsetMap;
+  // Insertion-ordered: generateInitCallsiteToFunction emits a store per
+  // entry, and StringRef hashing is seeded per process in some builds.
+  MapVector<StringRef, uint64_t> FuncOffsetMap;
 
   DenseMap<std::pair<BasicBlock *, Function *>,
            SmallVector<PHINode *, 4>> ArgPHIs;

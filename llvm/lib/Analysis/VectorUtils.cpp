@@ -1070,10 +1070,13 @@ void llvm::getMetadataToPropagate(
       LLVMContext::MD_noalias,      LLVMContext::MD_fpmath,
       LLVMContext::MD_nontemporal,  LLVMContext::MD_invariant_load,
       LLVMContext::MD_access_group, LLVMContext::MD_mmra};
+  // Cilksan's footprint tags (see CilksanFootprintsPass).
+  unsigned CilksanFP = Inst->getContext().getMDKindID("cilksan.fp");
 
   // Remove any unsupported metadata kinds from Metadata.
   for (unsigned Idx = 0; Idx != Metadata.size();) {
-    if (is_contained(SupportedIDs, Metadata[Idx].first)) {
+    if (is_contained(SupportedIDs, Metadata[Idx].first) ||
+        Metadata[Idx].first == CilksanFP) {
       ++Idx;
     } else {
       // Swap element to end and remove it.
@@ -1089,11 +1092,19 @@ Instruction *llvm::propagateMetadata(Instruction *Inst, ArrayRef<Value *> VL) {
     return Inst;
   SmallVector<std::pair<unsigned, MDNode *>> Metadata;
   getMetadataToPropagate(cast<Instruction>(VL[0]), Metadata);
+  unsigned CilksanFP = Inst->getContext().getMDKindID("cilksan.fp");
 
   for (auto &[Kind, MD] : Metadata) {
     for (int J = 1, E = VL.size(); MD && J != E; ++J) {
       const Instruction *IJ = cast<Instruction>(VL[J]);
       MDNode *IMD = IJ->getMetadata(Kind);
+
+      // A footprint tag stays if every access has it (the same marker's).
+      if (Kind == CilksanFP) {
+        if (IMD != MD)
+          MD = nullptr;
+        continue;
+      }
 
       switch (Kind) {
       case LLVMContext::MD_mmra: {
